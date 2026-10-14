@@ -72,6 +72,25 @@ pub enum TlsStream {
 }
 
 #[cfg(any(feature = "native_tls", feature = "rustls"))]
+impl TlsStream {
+	#[cfg_attr(
+		feature = "native_tls",
+		expect(
+			clippy::missing_const_for_fn,
+			reason = "The rustls backend queries a live TLS session"
+		)
+	)]
+	pub(crate) fn verified_client_certificate(&self) -> Option<Vec<u8>> {
+		match self {
+			#[cfg(feature = "rustls")]
+			Self::Rustls(stream) => stream.verified_client_certificate(),
+			#[cfg(feature = "native_tls")]
+			Self::Native(_) => None,
+		}
+	}
+}
+
+#[cfg(any(feature = "native_tls", feature = "rustls"))]
 impl AsyncRead for TlsStream {
 	fn poll_read(
 		self: Pin<&mut Self>,
@@ -253,3 +272,6 @@ mod tests {
 		assert_eq!(server.await.unwrap(), *b"ping");
 	}
 }
+
+#[cfg(all(test, any(feature = "native_tls", feature = "rustls")))]
+mod authentication;

@@ -38,6 +38,7 @@ fn server_config() -> ServerConfig {
 	ServerConfig {
 		port: 0,
 		tls: Some(TlsServerConfig {
+			client_ca_certificates: None,
 			server_certificate: fixture("localhost-cert.pem"),
 			server_key: fixture("localhost-key.pem"),
 		}),

@@ -161,6 +161,9 @@ fn same_ioa_deactivation_echo(ctx: CommandContext<'_>) -> CommandHandling {
 #[allow(clippy::too_many_lines)]
 #[async_trait::async_trait]
 impl RtuCommandHandler for MapCommandsToSameIoaMonitoring {
+	async fn select(&self, ctx: CommandContext<'_>) -> bool {
+		!self.handle_command(ctx).await.negative
+	}
 	async fn handle_command(&self, ctx: CommandContext<'_>) -> CommandHandling {
 		if matches!(ctx.asdu.cot, Cot::Deactivation) {
 			return same_ioa_deactivation_echo(ctx);

@@ -14,8 +14,8 @@ use iec104::{
 	asdu::Asdu,
 	config::ServerConfig,
 	rtu_server::{
-		CommandContext, CommandHandling, RtuCommandHandler, RtuHandleError, RtuInitialPoint,
-		RtuSystemHandlers, start_rtu_server_ephemeral,
+		RejectAllCommands, RtuHandleError, RtuInitialPoint, RtuResetProcessSystemHandler,
+		RtuSystemHandlers, SystemCommandContext, start_rtu_server_ephemeral,
 	},
 	server::{ConnectionId, Server, ServerCallback, error::ServerError},
 };
@@ -114,8 +114,12 @@ struct BlockCommand {
 	entered: Notify,
 }
 #[async_trait]
-impl RtuCommandHandler for BlockCommand {
-	async fn handle_command(&self, _: CommandContext<'_>) -> CommandHandling {
+impl RtuResetProcessSystemHandler for BlockCommand {
+	async fn handle_reset_process(
+		&self,
+		_: &mut SystemCommandContext<'_>,
+		_: &Server,
+	) -> Result<(), ServerError> {
 		self.entered.notify_one();
 		std::future::pending().await
 	}
@@ -126,20 +130,20 @@ async fn full_rtu_mailbox_rejects_local_work_and_closes_ingress_peer() {
 	let (rtu, addr) = start_rtu_server_ephemeral(
 		ServerConfig { rtu_queue_capacity: 2, ..ServerConfig::default() },
 		Vec::<RtuInitialPoint>::new(),
-		handler.clone(),
-		RtuSystemHandlers::default(),
+		Arc::new(RejectAllCommands),
+		RtuSystemHandlers { reset_process: handler.clone(), ..RtuSystemHandlers::default() },
 	)
 	.await
 	.expect("rtu");
 	let mut peer = started(addr).await;
 	let init = frame(&mut peer).await;
 	assert_eq!(init[6], 70);
-	peer.write_all(&[0x68, 14, 0, 0, 2, 0, 45, 1, 6, 0, 1, 0, 1, 0, 0, 1])
+	peer.write_all(&[0x68, 14, 0, 0, 2, 0, 105, 1, 6, 0, 1, 0, 1, 0, 0, 1])
 		.await
 		.expect("first command");
 	timeout(WAIT, handler.entered.notified()).await.expect("handler entered");
 	for sequence in 1..=3 {
-		peer.write_all(&[0x68, 14, sequence * 2, 0, 2, 0, 45, 1, 6, 0, 1, 0, 1, 0, 0, 1])
+		peer.write_all(&[0x68, 14, sequence * 2, 0, 2, 0, 105, 1, 6, 0, 1, 0, 1, 0, 0, 1])
 			.await
 			.expect("queued command");
 	}
@@ -171,4 +175,47 @@ async fn invalid_queue_configuration_is_rejected() {
 				.is_err()
 		);
 	}
+}
+
+struct SlowSystem;
+#[async_trait]
+impl RtuResetProcessSystemHandler for SlowSystem {
+	async fn handle_reset_process(
+		&self,
+		ctx: &mut SystemCommandContext<'_>,
+		server: &Server,
+	) -> Result<(), ServerError> {
+		tokio::time::sleep(Duration::from_millis(60)).await;
+		let mut reply = ctx.asdu.clone();
+		reply.cot = iec104::cot::Cot::ActivationConfirmation;
+		server.send_asdu(ctx.connection_id, reply).await
+	}
+}
+#[tokio::test]
+async fn process_command_timeout_does_not_cancel_system_traffic() {
+	let (rtu, addr) = start_rtu_server_ephemeral(
+		ServerConfig { command_timeout: Duration::from_millis(10), ..Default::default() },
+		Vec::<RtuInitialPoint>::new(),
+		Arc::new(RejectAllCommands),
+		RtuSystemHandlers { reset_process: Arc::new(SlowSystem), ..Default::default() },
+	)
+	.await
+	.expect("rtu");
+	let mut peer = started(addr).await;
+	assert_eq!(frame(&mut peer).await[6], 70);
+	peer.write_all(&[0x68, 14, 0, 0, 2, 0, 105, 1, 6, 0, 1, 0, 0, 0, 0, 1])
+		.await
+		.expect("system request");
+	let reply = frame(&mut peer).await;
+	assert_eq!((reply[6], reply[8]), (105, 7));
+	// Interrogation remains available on the same connection after the slow
+	// handler.
+	peer.write_all(&[0x68, 14, 2, 0, 4, 0, 100, 1, 6, 0, 1, 0, 0, 0, 0, 20])
+		.await
+		.expect("interrogation");
+	let confirm = frame(&mut peer).await;
+	assert_eq!((confirm[6], confirm[8]), (100, 7));
+	let termination = frame(&mut peer).await;
+	assert_eq!((termination[6], termination[8]), (100, 10));
+	rtu.shutdown().await.expect("shutdown");
 }

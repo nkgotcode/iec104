@@ -13,7 +13,7 @@ use snafu::{OptionExt as _, ResultExt as _, whatever};
 use tokio::{
 	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf},
 	select,
-	sync::{mpsc, oneshot},
+	sync::{mpsc, oneshot, watch},
 	time::Instant,
 };
 use tracing::instrument;
@@ -148,10 +148,21 @@ pub type SendAsduCommandAck = Result<(), SendAsduQueueError>;
 
 #[derive(Debug)]
 pub enum ReceiveHandlerCommand {
-	Start { session: u64 },
-	Stop { session: u64 },
-	Test { session: u64 },
-	Asdu { asdu: Asdu, session: Option<u64>, reply: oneshot::Sender<SendAsduCommandAck> },
+	Start {
+		session: u64,
+	},
+	Stop {
+		session: u64,
+	},
+	Test {
+		session: u64,
+	},
+	Asdu {
+		asdu: Asdu,
+		session: Option<u64>,
+		guard: Option<watch::Receiver<bool>>,
+		reply: oneshot::Sender<SendAsduCommandAck>,
+	},
 }
 
 #[async_trait::async_trait]
@@ -181,7 +192,7 @@ pub struct ReceiveHandler<'a, C: ReceiveHandlerCallback> {
 	t3: Pin<Box<tokio::time::Sleep>>,
 	unacknowledged_seq_num: VecDeque<(u16, Instant)>,
 	/// ASDUs from [`ReceiveHandlerCommand::Asdu`] waiting for `k` window space.
-	pending_outgoing_asdu: VecDeque<Asdu>,
+	pending_outgoing_asdu: VecDeque<(Asdu, Option<watch::Receiver<bool>>)>,
 	sent_counter: u16,
 	received_counter: u16,
 	unacknowledged_rcv_frames: u16,
@@ -299,9 +310,9 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 				}
 				Some(cmd) = self.rx.recv() => {
 					match cmd {
-						ReceiveHandlerCommand::Asdu { asdu, session, reply } => {
+						ReceiveHandlerCommand::Asdu { asdu, session, guard, reply } => {
 							if session != self.session { let _ = reply.send(Err(SendAsduQueueError::NotStarted)); continue; }
-							let ack = self.enqueue_incoming_asdu(asdu).await?;
+							let ack = self.enqueue_incoming_asdu(asdu, guard).await?;
 							let _ = reply.send(ack);
 						}
 						ReceiveHandlerCommand::Start { session } => {
@@ -350,7 +361,14 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 	/// when the pending queue is at
 	/// [`ProtocolConfig::max_pending_outgoing_asdu`](crate::config::ProtocolConfig::max_pending_outgoing_asdu);
 	/// returns `Err(Error)` on wire/protocol failure.
-	async fn enqueue_incoming_asdu(&mut self, asdu: Asdu) -> Result<SendAsduCommandAck, Error> {
+	async fn enqueue_incoming_asdu(
+		&mut self,
+		asdu: Asdu,
+		guard: Option<watch::Receiver<bool>>,
+	) -> Result<SendAsduCommandAck, Error> {
+		if guard.as_ref().is_some_and(|guard| !*guard.borrow()) {
+			return Ok(Err(SendAsduQueueError::NotStarted));
+		}
 		if !self.active || self.pending_transfer == Some(false) {
 			return Ok(Err(SendAsduQueueError::NotStarted));
 		}
@@ -362,7 +380,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 			return Ok(Err(SendAsduQueueError::PendingBufferFull));
 		}
 
-		self.pending_outgoing_asdu.push_back(asdu);
+		self.pending_outgoing_asdu.push_back((asdu, guard));
 		self.flush_pending_outgoing().await.whatever_context("Error sending queued ASDUs")?;
 
 		Ok(Ok(()))
@@ -464,9 +482,11 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 		while self.active
 			&& self.pending_transfer != Some(false)
 			&& self.unacknowledged_seq_num.len() < self.config.k as usize
-			&& let Some(asdu) = self.pending_outgoing_asdu.pop_front()
+			&& let Some((asdu, guard)) = self.pending_outgoing_asdu.pop_front()
 		{
-			self.send_one_asdu(asdu).await?;
+			if guard.as_ref().is_none_or(|guard| *guard.borrow()) {
+				self.send_one_asdu(asdu).await?;
+			}
 		}
 		Ok(())
 	}

@@ -2,10 +2,10 @@
 //! [`super::command_handler::RtuCommandHandler`], apply returned model updates,
 //! send activation or deactivation confirmation (COT matches IEC 60870-5-104).
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::collections::HashMap;
 
 use super::{
-	command_handler::{CommandContext, RtuCommandHandler},
+	command_handler::{CommandHandling, CommandSession},
 	model::{PointAddress, PointValue},
 	output::spontaneous_asdu,
 };
@@ -89,6 +89,28 @@ pub(super) async fn send_command_confirmation(
 	server.send_asdu(connection_id, reply).await
 }
 
+pub(super) async fn confirm_guarded(
+	server: &Server,
+	id: ConnectionId,
+	asdu: &Asdu,
+	session: &CommandSession,
+	handling: &CommandHandling,
+) -> Result<(), ServerError> {
+	server
+		.send_asdu_guarded(
+			id,
+			command_confirmation_asdu(
+				asdu,
+				command_reply_cot(asdu.cot),
+				handling.reply_type_id,
+				handling.reply_information_objects.clone(),
+				handling.negative,
+			),
+			session.delivery_guard(),
+		)
+		.await
+}
+
 fn can_apply_update(
 	model: &HashMap<PointAddress, PointValue>,
 	addr: PointAddress,
@@ -97,54 +119,75 @@ fn can_apply_update(
 	model.get(&addr).is_some_and(|ex| ex.type_id() == val.type_id())
 }
 
-async fn apply_model_updates(
+pub(super) async fn apply_model_updates(
 	model: &mut HashMap<PointAddress, PointValue>,
 	server: &Server,
 	updates: &[(PointAddress, PointValue)],
 ) -> Result<(), ServerError> {
 	for (addr, val) in updates {
-		if !can_apply_update(model, *addr, val) {
-			tracing::warn!(
-				%addr,
-				"command apply_updates: unknown point or type mismatch; skipping this entry"
-			);
-			continue;
-		}
 		model.insert(*addr, val.clone());
-		server.broadcast_asdu(spontaneous_asdu(*addr, val)).await?;
 	}
-	Ok(())
+	let mut result = Ok(());
+	for (addr, val) in updates {
+		if let Err(error) = server.broadcast_asdu(spontaneous_asdu(*addr, val)).await
+			&& result.is_ok()
+		{
+			result = Err(error);
+		}
+	}
+	result
 }
 
-/// Handle a process command ASDU. Call only when [`is_process_command`] is
-/// true.
-pub(super) async fn handle_process_command(
+pub(super) fn updates_valid(
+	model: &HashMap<PointAddress, PointValue>,
+	updates: &[(PointAddress, PointValue)],
+) -> bool {
+	let mut seen = std::collections::HashSet::new();
+	updates
+		.iter()
+		.all(|(address, value)| seen.insert(*address) && can_apply_update(model, *address, value))
+}
+
+pub(super) async fn apply_handling(
 	model: &mut HashMap<PointAddress, PointValue>,
 	server: &Server,
 	asdu: &Asdu,
-	connection_id: ConnectionId,
-	peer: SocketAddr,
-	handler: &Arc<dyn RtuCommandHandler>,
+	id: ConnectionId,
+	session: &CommandSession,
+	mut handling: CommandHandling,
 ) -> Result<(), ServerError> {
-	let handling = {
-		let ctx = CommandContext { connection_id, peer, asdu, model: &*model };
-		handler.handle_command(ctx).await
-	};
-
-	if !handling.negative {
-		apply_model_updates(model, server, &handling.apply_updates).await?;
+	if !handling.negative && !updates_valid(model, &handling.apply_updates) {
+		handling = CommandHandling::echo(asdu, true);
 	}
+	if !handling.negative {
+		// Partial broadcast failure does not suppress the originating command
+		// reply.
+		if let Err(error) = apply_model_updates(model, server, &handling.apply_updates).await {
+			tracing::debug!(%error,"Command monitoring delivery failed");
+		}
+	}
+	confirm_guarded(server, id, asdu, session, &handling).await
+}
 
-	send_command_confirmation(
-		server,
-		connection_id,
-		asdu,
-		handling.reply_type_id,
-		handling.reply_information_objects,
-		handling.negative,
-	)
-	.await?;
-	Ok(())
+pub(super) async fn send_command_termination(
+	server: &Server,
+	id: ConnectionId,
+	asdu: &Asdu,
+	session: &CommandSession,
+) -> Result<(), ServerError> {
+	server
+		.send_asdu_guarded(
+			id,
+			command_confirmation_asdu(
+				asdu,
+				Cot::ActivationTermination,
+				asdu.type_id,
+				asdu.information_objects.clone(),
+				false,
+			),
+			session.delivery_guard(),
+		)
+		.await
 }
 
 #[cfg(test)]
