@@ -1,5 +1,13 @@
 # Changes in this fork
 
+## Unreleased — framing and sequence serialization
+
+- Reject mismatched APDU lengths, reserved S-frame bits, ambiguous U-frame functions and out-of-range sequence counters.
+- Serialize sequence-addressed objects with one initial address; reject nonconsecutive or overflowing addresses and mismatched payload types.
+- Validate object counts in the public information-object parser and avoid zero-sized chunk panics.
+- Add bounded deterministic parser mutations, all-type VSQ/short-input coverage, and real TCP fragmentation interleaved with outgoing work. These checks supplement, not replace, external interoperability or conformance testing.
+
+
 ## Unreleased — authenticated TLS admission
 
 - Add required client certificate verification with a configured PEM trust bundle on rustls. Reject unsupported client-authentication policy on native_tls.
