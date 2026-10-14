@@ -25,6 +25,29 @@ Rust library for **[IEC 60870-5-104](https://en.wikipedia.org/wiki/IEC_60870-5#I
 
 This is **IEC 60870-5-104 only** (not 101 serial profiles). File transfer, integrated totals beyond what the RTU layer models, and every optional standard feature are not goals for v1 completeness—check [`TypeId`](https://docs.rs/iec104/latest/iec104/types_id/enum.TypeId.html) and module docs for what is encoded and parsed today.
 
+## Connection limits and shutdown
+
+`ServerConfig` now defaults to at most 64 accepted connections, counting pending
+TLS handshakes, with a 10-second TLS handshake deadline. Both values must be
+nonzero. Set `max_connections` and `tls_handshake_timeout` explicitly when needed;
+existing serialized configurations receive the defaults. Rust struct literals
+must add these fields or use `..ServerConfig::default()`.
+
+TLS setup runs independently for each admitted peer. A failed or stalled handshake
+does not stop the listener or block another admitted peer. Client TLS setup uses
+`ClientConfig::protocol.t0` as its handshake deadline.
+
+Call `Server::shutdown().await`, `RtuServerHandle::shutdown().await`, or
+`Client::shutdown().await` to cancel and join their owned work. Server/RTU shutdown
+applies to all clones. Pending I/O, callbacks and queued output are cancelled,
+without flushing or sending STOPDT; callbacks must be cancellation-safe and must
+not block executor threads. After successful shutdown, owned tasks are joined and
+sockets released. Repeated calls are safe; a client can reconnect afterward.
+Dropping the last server/RTU handle or dropping a client requests cancellation
+without waiting. Retain a handle and await shutdown when completion matters.
+These limits do not yet bound the RTU actor mailbox or prevent a slow output peer
+from delaying a broadcast; that work remains tracked separately.
+
 ## Examples
 
 Build and run from the repository root:

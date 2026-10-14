@@ -11,7 +11,8 @@ pub mod error;
 use snafu::{ResultExt as _, whatever};
 use tokio::{
 	net::TcpListener,
-	sync::{mpsc, oneshot},
+	sync::{Mutex, mpsc, oneshot, watch},
+	task::{JoinHandle, JoinSet},
 };
 
 #[cfg(any(feature = "native_tls", feature = "rustls"))]
@@ -91,6 +92,19 @@ pub enum ServerCommand {
 #[derive(Debug, Clone)]
 pub struct Server {
 	tx: mpsc::Sender<ServerCommand>,
+	lifecycle: Arc<ServerLifecycle>,
+}
+
+#[derive(Debug)]
+struct ServerLifecycle {
+	stop: watch::Sender<()>,
+	task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for ServerLifecycle {
+	fn drop(&mut self) {
+		self.stop.send_replace(());
+	}
 }
 
 struct InnerServer<C: ServerCallback + Send + Sync + 'static> {
@@ -101,6 +115,7 @@ struct InnerServer<C: ServerCallback + Send + Sync + 'static> {
 	#[cfg(any(feature = "native_tls", feature = "rustls"))]
 	acceptor: Option<crate::tls::TlsAcceptor>,
 	listener: TcpListener,
+	pending: JoinSet<(SocketAddr, Result<Connection, Error>)>,
 }
 
 impl Server {
@@ -108,15 +123,7 @@ impl Server {
 		config: ServerConfig,
 		callback: C,
 	) -> Result<Self, Error> {
-		let (tx, rx) = mpsc::channel(1024);
-		let inner_server = InnerServer::connect(config, Arc::new(callback), rx).await?;
-		tokio::spawn(async move {
-			let _ = inner_server
-				.start()
-				.await
-				.inspect_err(|e| tracing::error!("Error in running server: {e}"));
-		});
-		Ok(Self { tx })
+		Self::start_with_listen_addr(config, callback).await.map(|(server, _)| server)
 	}
 
 	/// Like [`Self::start`], but also returns the socket address the TCP
@@ -131,13 +138,43 @@ impl Server {
 		let listen_addr = inner_server
 			.listen_local_addr()
 			.with_whatever_context(|e| format!("Unable to read listener local address: {e}"))?;
-		tokio::spawn(async move {
-			let _ = inner_server
-				.start()
-				.await
-				.inspect_err(|e| tracing::error!("Error in running server: {e}"));
+		let (stop, mut stopped) = watch::channel(());
+		let task = tokio::spawn(async move {
+			let mut inner_server = inner_server;
+			tokio::select! {
+				biased;
+				_ = stopped.changed() => {},
+				result = inner_server.start() => {
+					if let Err(e) = result { tracing::error!("Error in running server: {e}"); }
+				}
+			}
+			inner_server.pending.shutdown().await;
+			for connection in inner_server.connections.values() {
+				connection.abort();
+			}
+			for (_, mut connection) in inner_server.connections.drain() {
+				connection.join().await;
+			}
 		});
-		Ok((Self { tx }, listen_addr))
+		let lifecycle = Arc::new(ServerLifecycle { stop, task: Mutex::new(Some(task)) });
+		Ok((Self { tx, lifecycle }, listen_addr))
+	}
+
+	/// Stop accepting, cancel pending handshakes, I/O and callbacks, then join
+	/// all server tasks. This is idempotent and applies to every clone.
+	/// Queued output is discarded, not flushed. No callback runs after success.
+	/// Cancelling this future still requests shutdown; a later call can join
+	/// it. Dropping the last handle requests the same cleanup without
+	/// waiting.
+	pub async fn shutdown(&self) -> Result<(), Error> {
+		self.lifecycle.stop.send_replace(());
+		let mut task = self.lifecycle.task.lock().await;
+		if let Some(handle) = task.as_mut() {
+			let result = handle.await;
+			*task = None;
+			result.whatever_context("Server task failed during shutdown")?;
+		}
+		Ok(())
 	}
 
 	pub async fn send_asdu(&self, id: ConnectionId, asdu: Asdu) -> Result<(), error::ServerError> {
@@ -164,6 +201,9 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 		// Reject spec-violating k/w combinations (IEC 60870-5-104 §5.2)
 		// before binding the socket so misconfiguration fails fast.
 		config.protocol.validate().whatever_context("Invalid protocol configuration")?;
+		if config.max_connections == 0 || config.tls_handshake_timeout.is_zero() {
+			whatever!("Server connection limit and TLS handshake timeout must be nonzero");
+		}
 
 		let bind_addr = format!("{}:{}", config.address, config.port);
 		let listener = TcpListener::bind(&bind_addr)
@@ -188,6 +228,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 			#[cfg(any(feature = "native_tls", feature = "rustls"))]
 			acceptor,
 			listener,
+			pending: JoinSet::new(),
 		})
 	}
 
@@ -195,7 +236,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 		self.listener.local_addr()
 	}
 
-	async fn start(mut self) -> Result<(), Error> {
+	async fn start(&mut self) -> Result<(), Error> {
 		let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<ConnectionId>();
 		let mut next_id = ConnectionId::new();
 
@@ -204,29 +245,44 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 				accept_result = self.listener.accept() => {
 					let (socket, address) =
 						accept_result.whatever_context("Error accepting a new connection")?;
-					let connection = {
-						#[cfg(any(feature = "native_tls", feature = "rustls"))]
-						{
-							match &self.acceptor {
-								Some(acceptor) => Connection::Tls(Box::new(
-									acceptor
-										.clone()
-										.accept(socket)
-										.await
-										.whatever_context("Error doing the TLS handshake")?,
-								)),
-								None => Connection::Tcp(socket),
+					if self.connections.len() + self.pending.len() >= self.config.max_connections {
+						drop(socket);
+						continue;
+					}
+					#[cfg(any(feature = "native_tls", feature = "rustls"))]
+					let acceptor = self.acceptor.clone();
+					#[cfg(any(feature = "native_tls", feature = "rustls"))]
+					let deadline = self.config.tls_handshake_timeout;
+					self.pending.spawn(async move {
+						let result = async {
+							#[cfg(any(feature = "native_tls", feature = "rustls"))]
+							if let Some(acceptor) = acceptor {
+								let stream = tokio::time::timeout(deadline, acceptor.accept(socket))
+									.await.whatever_context("TLS handshake timed out")?
+									.whatever_context("TLS handshake failed")?;
+								return Ok(Connection::Tls(Box::new(stream)));
 							}
+							Ok(Connection::Tcp(socket))
+						}.await;
+						(address, result)
+					});
+				}
+				result = self.pending.join_next(), if !self.pending.is_empty() => {
+					let Some(result) = result else { continue; };
+					let (address, connection) = match result {
+						Ok((address, Ok(connection))) => (address, connection),
+						Ok((address, Err(error))) => {
+							tracing::debug!(?address, %error, "Connection setup failed");
+							continue;
 						}
-						#[cfg(not(any(feature = "native_tls", feature = "rustls")))]
-						{
-							Connection::Tcp(socket)
+						Err(error) => {
+							tracing::error!(%error, "Connection setup task failed");
+							continue;
 						}
 					};
 					// TODO: Do we want to accept or decline the connection based on the callback response?
 					self.callback.on_new_connection(address).await;
 
-					// TODO: Do want to have a max number of connections?
 
 					// Gets the next available connection id
 					while self.connections.contains_key(&next_id) {
@@ -243,7 +299,8 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 					if let Some(id) = closed_id {
 						let connection_handler = self.connections.remove(&id);
 						match connection_handler {
-							Some(connection_handler) => {
+							Some(mut connection_handler) => {
+								connection_handler.join().await;
 								self.callback.on_connection_stopped(id, connection_handler.address).await;
 							}
 							None => {

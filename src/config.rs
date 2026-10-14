@@ -138,6 +138,14 @@ pub struct ServerConfig {
 	/// The TLS configuration.
 	#[serde(default)]
 	pub tls: Option<TlsServerConfig>,
+	/// Maximum accepted sockets, including pending TLS handshakes. Default 64.
+	/// Must be nonzero; excess sockets are closed without starting a task.
+	#[serde(default = "default_max_connections")]
+	pub max_connections: usize,
+	/// Deadline for each server TLS handshake. Default 10 seconds; must be
+	/// nonzero.
+	#[serde(with = "humantime_serde", default = "default_duration::<10>")]
+	pub tls_handshake_timeout: Duration,
 }
 
 /// The server TLS configuration
@@ -183,6 +191,8 @@ impl Default for ServerConfig {
 			port: 2404,
 			protocol: ProtocolConfig::default(),
 			tls: None,
+			max_connections: default_max_connections(),
+			tls_handshake_timeout: Duration::from_secs(10),
 		}
 	}
 }
@@ -197,6 +207,10 @@ const fn default_max_pending_outgoing_asdu() -> u32 {
 
 const fn default_duration<const N: u64>() -> Duration {
 	Duration::from_secs(N)
+}
+
+const fn default_max_connections() -> usize {
+	64
 }
 
 #[cfg(test)]

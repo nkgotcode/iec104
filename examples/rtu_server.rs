@@ -124,5 +124,7 @@ async fn main() -> Result<(), Whatever> {
 		}
 	}
 
+	rtu.shutdown().await.whatever_context("Shutdown failed")?;
+
 	Ok(())
 }

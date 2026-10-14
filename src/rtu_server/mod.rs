@@ -80,7 +80,7 @@ pub use command_handler::{
 pub use command_presets::MapCommandsToSameIoaMonitoring;
 pub use error::{RtuHandleError, SetPointError};
 pub use model::{PointAddress, PointValue, RtuInitialMaps, RtuInitialPoint};
-use snafu::whatever;
+use snafu::{ResultExt as _, whatever};
 pub use system_command_handler::{
 	CounterInterrogationContext, DefaultRtuClockSyncSystemHandler,
 	DefaultRtuCounterInterrogationHandler, DefaultRtuReadSystemHandler,
@@ -179,13 +179,13 @@ impl RtuServer {
 		command_handler: Arc<dyn RtuCommandHandler>,
 		system_handlers: RtuSystemHandlers,
 	) -> Result<RtuServerHandle, Error> {
+		let RtuInitialMaps { points, interrogation_groups, counter_groups } =
+			build_rtu_initial_maps(initial_points)?;
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 		let ingress = actor::NetworkIngress::new(tx.clone());
 		let server = crate::server::Server::start(config, ingress).await?;
-		let RtuInitialMaps { points, interrogation_groups, counter_groups } =
-			build_rtu_initial_maps(initial_points)?;
 		let server_for_actor = server.clone();
-		tokio::spawn(actor::run_actor(
+		let task = tokio::spawn(actor::run_actor(
 			rx,
 			server_for_actor,
 			points,
@@ -194,7 +194,7 @@ impl RtuServer {
 			command_handler,
 			system_handlers,
 		));
-		Ok(RtuServerHandle { tx })
+		Ok(RtuServerHandle::new(tx, server, task))
 	}
 }
 
@@ -211,14 +211,14 @@ pub async fn start_rtu_server_ephemeral(
 ) -> Result<(RtuServerHandle, std::net::SocketAddr), Error> {
 	server_config.address = "127.0.0.1".into();
 	server_config.port = 0;
+	let RtuInitialMaps { points, interrogation_groups, counter_groups } =
+		build_rtu_initial_maps(initial_points)?;
 	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 	let ingress = actor::NetworkIngress::new(tx.clone());
 	let (server, listen_addr) =
 		crate::server::Server::start_with_listen_addr(server_config, ingress).await?;
-	let RtuInitialMaps { points, interrogation_groups, counter_groups } =
-		build_rtu_initial_maps(initial_points)?;
 	let server_for_actor = server.clone();
-	tokio::spawn(actor::run_actor(
+	let task = tokio::spawn(actor::run_actor(
 		rx,
 		server_for_actor,
 		points,
@@ -227,7 +227,7 @@ pub async fn start_rtu_server_ephemeral(
 		command_handler,
 		system_handlers,
 	));
-	Ok((RtuServerHandle { tx }, listen_addr))
+	Ok((RtuServerHandle::new(tx, server, task), listen_addr))
 }
 
 /// `Clone` handle for updates from any task (e.g. NATS subscriber). Sends into
@@ -235,6 +235,19 @@ pub async fn start_rtu_server_ephemeral(
 #[derive(Clone)]
 pub struct RtuServerHandle {
 	tx: tokio::sync::mpsc::UnboundedSender<actor::ActorMsg>,
+	lifecycle: Arc<RtuLifecycle>,
+}
+
+struct RtuLifecycle {
+	server: crate::server::Server,
+	abort: tokio::task::AbortHandle,
+	task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for RtuLifecycle {
+	fn drop(&mut self) {
+		self.abort.abort();
+	}
 }
 
 impl std::fmt::Debug for RtuServerHandle {
@@ -244,6 +257,42 @@ impl std::fmt::Debug for RtuServerHandle {
 }
 
 impl RtuServerHandle {
+	fn new(
+		tx: tokio::sync::mpsc::UnboundedSender<actor::ActorMsg>,
+		server: crate::server::Server,
+		task: tokio::task::JoinHandle<()>,
+	) -> Self {
+		let abort = task.abort_handle();
+		Self {
+			tx,
+			lifecycle: Arc::new(RtuLifecycle {
+				server,
+				abort,
+				task: tokio::sync::Mutex::new(Some(task)),
+			}),
+		}
+	}
+
+	/// Cancel and join the model actor and network server, including pending
+	/// commands and callbacks. Queued output is discarded. All clones stop;
+	/// subsequent updates fail. Repeated calls are safe. Dropping the last
+	/// handle cancels the actor and requests network cleanup without joining.
+	pub async fn shutdown(&self) -> Result<(), Error> {
+		self.lifecycle.abort.abort();
+		let server_result = self.lifecycle.server.shutdown().await;
+		let mut task = self.lifecycle.task.lock().await;
+		if let Some(handle) = task.as_mut() {
+			let result = handle.await;
+			*task = None;
+			if let Err(error) = result
+				&& !error.is_cancelled()
+			{
+				return Err(error).whatever_context("RTU actor failed during shutdown");
+			}
+		}
+		server_result
+	}
+
 	/// Update an existing point and broadcast a spontaneous ASDU to all started
 	/// connections.
 	pub async fn set_point(

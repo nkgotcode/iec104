@@ -35,9 +35,15 @@ pub enum ConnectionState {
 pub struct ConnectionHandler {
 	pub id: ConnectionId,
 	pub address: SocketAddr,
-	pub _task: tokio::task::JoinHandle<()>,
+	pub task: tokio::task::JoinHandle<()>,
 	pub tx: mpsc::Sender<ReceiveHandlerCommand>,
 	pub state: Arc<AtomicConnectionState>,
+}
+
+impl Drop for ConnectionHandler {
+	fn drop(&mut self) {
+		self.task.abort();
+	}
 }
 
 struct InnerConnectionHandler<C: ServerCallback + Send + Sync + 'static> {
@@ -80,8 +86,19 @@ impl ConnectionHandler {
 				.inspect_err(|e| tracing::error!("Error in running connection handler: {e}"));
 			let _ = tx.send(id);
 		});
-		Self { id, address, _task: task, tx: cmd_tx, state }
+		Self { id, address, task, tx: cmd_tx, state }
 	}
+	pub fn abort(&self) {
+		self.task.abort();
+	}
+	pub async fn join(&mut self) {
+		if let Err(error) = (&mut self.task).await
+			&& !error.is_cancelled()
+		{
+			tracing::error!(%error, "Connection task failed");
+		}
+	}
+
 	pub async fn send_asdu(&self, asdu: Asdu) -> Result<(), error::ServerError> {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		self.tx

@@ -140,6 +140,26 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 		Ok(())
 	}
 
+	/// Cancel I/O, callbacks and reconnect attempts, and join the receive task.
+	/// Idempotent; the client can be connected again afterward. Queued output
+	/// is discarded. Dropping a client cancels without waiting for completion.
+	pub async fn shutdown(&mut self) -> Result<(), Error> {
+		self.write_tx = None;
+		self.connection_handler_state = None;
+		self.out_buffer_full.store(false, std::sync::atomic::Ordering::Relaxed);
+		if let Some(task) = self.receive_task.as_mut() {
+			task.abort();
+			let result = task.await;
+			self.receive_task = None;
+			if let Err(error) = result
+				&& !error.is_cancelled()
+			{
+				return Err(error).whatever_context("Client task failed during shutdown");
+			}
+		}
+		Ok(())
+	}
+
 	#[instrument(level = "debug")]
 	pub async fn send_asdu(&self, asdu: Asdu) -> Result<(), ClientError> {
 		self.check_connection_started()?;
@@ -412,5 +432,13 @@ impl<C: ClientCallback + Send + Sync + 'static> Debug for Client<C> {
 				.as_ref()
 				.map(|state| state.load(std::sync::atomic::Ordering::Relaxed))
 		)
+	}
+}
+
+impl<C: ClientCallback + Send + Sync + 'static> Drop for Client<C> {
+	fn drop(&mut self) {
+		if let Some(task) = &self.receive_task {
+			task.abort();
+		}
 	}
 }

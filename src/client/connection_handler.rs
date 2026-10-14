@@ -166,10 +166,13 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 			Some(tls) => {
 				let connector = crate::tls::build_client_connector(tls)?;
 				Ok(Connection::Tls(Box::new(
-					connector
-						.connect(&config.address, stream)
-						.await
-						.whatever_context("Error connecting")?,
+					tokio::time::timeout(
+						config.protocol.t0,
+						connector.connect(&config.address, stream),
+					)
+					.await
+					.whatever_context("TLS handshake timed out")?
+					.whatever_context("Error connecting")?,
 				)))
 			}
 			#[cfg(not(any(feature = "native_tls", feature = "rustls")))]

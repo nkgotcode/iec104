@@ -54,6 +54,8 @@ async fn main() -> Result<(), Whatever> {
 		}
 	}
 
+	server.shutdown().await.whatever_context("Shutdown failed")?;
+
 	Ok(())
 }
 
