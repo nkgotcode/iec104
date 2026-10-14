@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
 use atomic_enum::atomic_enum;
-use snafu::{ResultExt as _, whatever};
+use snafu::{OptionExt as _, ResultExt as _, whatever};
 use tokio::{
 	io::{ReadHalf, WriteHalf},
 	net::TcpStream,
@@ -30,8 +30,7 @@ pub enum ConnectionHandlerState {
 }
 
 pub struct ConnectionHandler<C: ClientCallback + Send + Sync + 'static> {
-	read_connection: ReadHalf<Connection>,
-	write_connection: WriteHalf<Connection>,
+	connection: Option<(ReadHalf<Connection>, WriteHalf<Connection>)>,
 	callback: Arc<InnerClientCallback<C>>,
 	config: ClientConfig,
 	state: Arc<AtomicConnectionHandlerState>,
@@ -57,8 +56,7 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 			callback: callback.clone(),
 			config,
 			state: callback.state.clone(),
-			read_connection,
-			write_connection,
+			connection: Some((read_connection, write_connection)),
 			rx,
 			out_buffer_full,
 		})
@@ -104,6 +102,9 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 							ConnectionHandlerState::Reconnecting,
 							std::sync::atomic::Ordering::Relaxed,
 						);
+						self.connection = None;
+						self.callback.callback.on_connection_disconnected().await;
+						self.callback.on_error(e).await;
 						continue;
 					}
 					tracing::debug!("StartDT activation confirmed");
@@ -114,9 +115,11 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 				}
 				ConnectionHandlerState::Started => {
 					self.callback.on_connection_started().await;
+					let (read, write) =
+						self.connection.as_mut().whatever_context("Connection missing")?;
 					if let Err(e) = ReceiveHandler::new(
-						&mut self.read_connection,
-						&mut self.write_connection,
+						read,
+						write,
 						self.callback.clone(),
 						self.config.protocol.clone(),
 						&mut self.rx,
@@ -131,6 +134,7 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 							ConnectionHandlerState::Reconnecting,
 							std::sync::atomic::Ordering::Relaxed,
 						);
+						self.connection = None;
 						self.callback.callback.on_connection_disconnected().await;
 						self.callback.on_error(e).await;
 						continue;
@@ -150,7 +154,7 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 						tokio::time::sleep(self.config.protocol.t0).await;
 						continue;
 					};
-					(self.read_connection, self.write_connection) = tokio::io::split(connection);
+					self.connection = Some(tokio::io::split(connection));
 					self.callback.session.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 					self.out_buffer_full.store(false, std::sync::atomic::Ordering::Relaxed);
 					self.state.store(
@@ -198,17 +202,15 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 
 	#[instrument(level = "debug", skip_all)]
 	pub async fn send_start_dt(&mut self) -> Result<(), Error> {
+		let (read, write) = self.connection.as_mut().whatever_context("Connection missing")?;
 		let mut buffer = [0; MAX_APDU_FRAME_SIZE];
-		send_frame(&mut self.write_connection, &START_DT_ACT_FRAME)
+		send_frame(write, &START_DT_ACT_FRAME)
 			.await
 			.whatever_context("Error sending startDT activation")?;
 
-		let apdu = tokio::time::timeout(
-			self.config.protocol.t1,
-			receive_apdu(&mut self.read_connection, &mut buffer),
-		)
-		.await
-		.whatever_context("Timeout waiting for startDT activation")?;
+		let apdu = tokio::time::timeout(self.config.protocol.t1, receive_apdu(read, &mut buffer))
+			.await
+			.whatever_context("Timeout waiting for startDT activation")?;
 
 		let apdu = apdu.whatever_context("Error receiving APDU")?;
 		// Per IEC 60870-5-104 §5.3, only a U-frame with the

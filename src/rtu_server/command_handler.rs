@@ -43,9 +43,9 @@ pub struct CommandHandling {
 	pub reply_type_id: TypeId,
 	/// Objects mirrored in the confirmation (typically echo of the command).
 	pub reply_information_objects: InformationObjects,
-	/// When [`Self::negative`] is false, updates are validated as a batch before
-	/// mutation. Unknown, duplicate, type-mismatched or stale targets reject
-	/// the immediate command without applying any updates.
+	/// When [`Self::negative`] is false, updates are validated as a batch
+	/// before mutation. Unknown, duplicate, type-mismatched or stale
+	/// targets reject the immediate command without applying any updates.
 	pub apply_updates: Vec<(PointAddress, PointValue)>,
 }
 
