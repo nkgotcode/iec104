@@ -281,3 +281,62 @@ async fn rtu_retries_initialization_after_immediate_stop() {
 	assert_eq!(frame(&mut peer).await[6], 70);
 	rtu.shutdown().await.expect("shutdown");
 }
+
+struct ClientLoss(mpsc::UnboundedSender<()>);
+#[async_trait]
+impl iec104::client::ClientCallback for ClientLoss {
+	async fn on_new_objects(&self, _: Asdu) {}
+	async fn on_connection_disconnected(&self) {
+		let _ = self.0.send(());
+	}
+}
+#[tokio::test]
+async fn client_reports_disconnects_during_initial_and_reconnect_startdt() {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+	let (tx, mut losses) = mpsc::unbounded_channel();
+	let mut client = iec104::client::Client::new(
+		iec104::config::ClientConfig {
+			port: listener.local_addr().expect("address").port(),
+			..Default::default()
+		},
+		ClientLoss(tx),
+	);
+	client.connect().await.expect("connect");
+	client.start_receiving().await.expect("start");
+	for _ in 0..2 {
+		let (mut peer, _) =
+			timeout(WAIT, listener.accept()).await.expect("accept deadline").expect("accept");
+		assert_eq!(frame(&mut peer).await, [0x68, 4, 7, 0, 0, 0]);
+		drop(peer);
+		timeout(WAIT, losses.recv())
+			.await
+			.expect("disconnect event deadline")
+			.expect("disconnect event");
+	}
+	client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn failed_handshake_releases_old_socket_before_retrying_connect() {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+	let (tx, _losses) = mpsc::unbounded_channel();
+	let mut client = iec104::client::Client::new(
+		iec104::config::ClientConfig {
+			port: listener.local_addr().expect("address").port(),
+			..Default::default()
+		},
+		ClientLoss(tx),
+	);
+	client.connect().await.expect("connect");
+	client.start_receiving().await.expect("start");
+	let (mut peer, _) = listener.accept().await.expect("accept");
+	drop(listener);
+	assert_eq!(frame(&mut peer).await, [0x68, 4, 7, 0, 0, 0]);
+	peer.write_all(&[0x68, 4, 1, 0, 0, 0]).await.expect("invalid start response");
+	let mut byte = [0];
+	assert_eq!(
+		timeout(WAIT, peer.read(&mut byte)).await.expect("old socket closes").expect("read"),
+		0
+	);
+	client.shutdown().await.expect("shutdown");
+}
