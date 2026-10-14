@@ -1,5 +1,12 @@
 # Changes in this fork
 
+## Unreleased — authenticated TLS admission
+
+- Add required client certificate verification with a configured PEM trust bundle on rustls. Reject unsupported client-authentication policy on native_tls.
+- Expose verified peer certificate identity to an optional low-level authorization callback before protocol admission. Bound admission callbacks per connection.
+- Exercise actual TLS trust, hostname, missing/expired/untrusted certificate and authorization failures with public test credentials.
+- TlsServerConfig gains client_ca_certificates; serialized configurations default to None, while exhaustive Rust literals need the new field.
+
 ## Unreleased — command lifecycle
 
 - Add bounded deferred command preparation/completion without blocking telemetry or interrogation; positive ACT_TERM is sent only on success.

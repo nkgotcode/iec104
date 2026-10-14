@@ -187,6 +187,27 @@ iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["native_tls"
 iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["rustls"] }
 ```
 
+## TLS client authentication and admission
+
+With `rustls`, set `TlsServerConfig.client_ca_certificates` to a PEM trust bundle
+to **require** a valid client certificate. Missing, untrusted and expired client
+certificates fail the TLS handshake. An unreadable or empty trust bundle fails
+server construction. `None` keeps server-only TLS; it does not authenticate clients.
+The `native_tls` backend rejects a required client-authentication configuration
+instead of silently accepting unauthenticated clients.
+
+Low-level `ServerCallback::authorize_peer` receives a `PeerIdentity` before
+STARTDT or ASDU processing. Its `verified_client_certificate_der` is the verified
+leaf certificate when required client authentication succeeds; `encrypted` alone
+is not proof of client identity. Return `false` to close the connection. The default
+returns `true`, admitting all peers that satisfy the transport policy. This callback
+and `on_new_connection` run in the individual connection task, with a combined
+`tls_handshake_timeout` deadline; a blocked admission callback does not stall other
+connections. The RTU convenience API enforces the configured TLS trust policy;
+custom per-certificate admission uses the low-level server API.
+
+This is a transport admission mechanism, not a claim of IEC 62351 conformance.
+
 ## Requirements
 
 - **Rust** with support for the edition and features declared in `Cargo.toml` (currently **Edition 2024**).
@@ -197,7 +218,7 @@ iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["rustls"] }
 - **Work in progress:** public APIs and default RTU behavior may change between minor releases until the crate stabilises.
 - **Coverage:** not every standard type ID or edge case is implemented or battle-tested; prefer explicit tests for your IO list.
 - **Low-level `Server`:** does not implement an RTU process image—you get raw ASDUs and must send replies yourself.
-- **Security:** TLS is available for transport when the `native_tls` or `rustls` feature is enabled; application-layer security (authentication, authorisation) is outside IEC 104 and not provided here.
+- **Security:** certificate authentication and connection authorization are available as described above. Application command permissions, credential provisioning/rotation, revocation policy, and IEC 62351 conformance are not provided by this library.
 - **101 / serial:** out of scope.
 
 ## Contributing

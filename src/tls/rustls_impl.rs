@@ -32,6 +32,20 @@ pub(crate) enum RustlsTlsStream {
 	Server(tokio_rustls::server::TlsStream<TcpStream>),
 }
 
+impl RustlsTlsStream {
+	pub(crate) fn verified_client_certificate(&self) -> Option<Vec<u8>> {
+		match self {
+			Self::Server(stream) => stream
+				.get_ref()
+				.1
+				.peer_certificates()
+				.and_then(|certs| certs.first())
+				.map(|cert| cert.to_vec()),
+			Self::Client(_) => None,
+		}
+	}
+}
+
 impl AsyncRead for RustlsTlsStream {
 	fn poll_read(
 		self: Pin<&mut Self>,
@@ -215,8 +229,19 @@ pub(crate) fn build_server_acceptor(tls: &TlsServerConfig) -> Result<RustlsServe
 
 	let certs = load_certs(&tls.server_certificate)?;
 	let key = load_private_key(&tls.server_key)?;
+	let verifier = if let Some(path) = &tls.client_ca_certificates {
+		let mut roots = RootCertStore::empty();
+		for certificate in load_certs(path)? {
+			roots.add(certificate).whatever_context("Invalid client trust anchor")?;
+		}
+		rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+			.build()
+			.whatever_context("Invalid client authentication policy")?
+	} else {
+		rustls::server::WebPkiClientVerifier::no_client_auth()
+	};
 	let config = ServerConfig::builder()
-		.with_no_client_auth()
+		.with_client_cert_verifier(verifier)
 		.with_single_cert(certs, key)
 		.whatever_context("Error creating TLS acceptor")?;
 	Ok(RustlsServerAcceptor(TlsAcceptor::from(Arc::new(config))))

@@ -168,6 +168,11 @@ pub struct ServerConfig {
 /// The server TLS configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TlsServerConfig {
+	/// PEM trust anchors for required client-certificate authentication.
+	/// None preserves server-only TLS. Supported by rustls; native_tls rejects
+	/// this setting instead of silently allowing unauthenticated clients.
+	#[serde(default)]
+	pub client_ca_certificates: Option<PathBuf>,
 	/// Path to the server certificate.
 	pub server_certificate: PathBuf,
 	/// Path to the server key

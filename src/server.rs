@@ -41,12 +41,34 @@ impl ConnectionId {
 	}
 }
 
+/// Transport identity available before protocol data transfer. A certificate
+/// is present only after successful required client-certificate verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+	/// True for TLS, including server-only TLS without client authentication.
+	pub encrypted: bool,
+	/// Authenticated leaf certificate in DER form. Applications can match a
+	/// provisioned certificate or parse it for their authorization policy.
+	pub verified_client_certificate_der: Option<Vec<u8>>,
+}
+
 #[async_trait::async_trait]
 #[expect(
 	clippy::double_must_use,
 	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
 )]
 pub trait ServerCallback {
+	/// Authorize a peer before STARTDT or ingress callbacks. The default allows
+	/// admission; certificate authentication alone is not application
+	/// permission.
+	async fn authorize_peer(
+		&self,
+		_id: ConnectionId,
+		_address: SocketAddr,
+		_identity: &PeerIdentity,
+	) -> bool {
+		true
+	}
 	async fn on_new_objects(&self, asdu: Asdu, id: ConnectionId, address: SocketAddr);
 	/// Fallible ingress admission. Returning an error closes this peer. The
 	/// default preserves the existing callback; adapters can reject overload.
@@ -450,10 +472,6 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 							continue;
 						}
 					};
-					// TODO: Do we want to accept or decline the connection based on the callback response?
-					self.callback.on_new_connection(address).await;
-
-
 					// Gets the next available connection id
 					while self.connections.contains_key(&next_id) {
 						next_id = next_id.next();

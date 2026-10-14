@@ -80,6 +80,9 @@ pub(crate) fn build_client_connector(
 }
 
 pub(crate) fn build_server_acceptor(tls: &TlsServerConfig) -> Result<NativeServerAcceptor, Error> {
+	if tls.client_ca_certificates.is_some() {
+		snafu::whatever!("native_tls cannot enforce client authentication; enable rustls");
+	}
 	let identity = Identity::from_pkcs8(
 		std::fs::read(&tls.server_certificate)
 			.whatever_context("Failed to read server certificate")?

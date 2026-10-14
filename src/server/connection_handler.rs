@@ -20,7 +20,7 @@ use crate::{
 	receive_handler::{
 		ReceiveHandler, ReceiveHandlerCommand, SendAsduQueueError, receive_apdu, send_frame,
 	},
-	server::{InnerServerCallback, ServerCallback, error},
+	server::{InnerServerCallback, PeerIdentity, ServerCallback, error},
 };
 
 #[atomic_enum]
@@ -61,6 +61,7 @@ impl Drop for ClosedNotification {
 }
 
 struct InnerConnectionHandler<C: ServerCallback + Send + Sync + 'static> {
+	identity: PeerIdentity,
 	read_connection: ReadHalf<Connection>,
 	write_connection: WriteHalf<Connection>,
 	callback: Arc<InnerServerCallback<C>>,
@@ -80,10 +81,21 @@ impl ConnectionHandler {
 		callback: InnerServerCallback<C>,
 		tx: mpsc::UnboundedSender<ConnectionId>,
 	) -> Self {
+		let identity = match &connection {
+			Connection::Tcp(_) => {
+				PeerIdentity { encrypted: false, verified_client_certificate_der: None }
+			}
+			#[cfg(any(feature = "native_tls", feature = "rustls"))]
+			Connection::Tls(stream) => PeerIdentity {
+				encrypted: true,
+				verified_client_certificate_der: stream.verified_client_certificate(),
+			},
+		};
 		let (read_connection, write_connection) = tokio::io::split(connection);
 		let (cmd_tx, rx) = mpsc::channel(config.command_capacity);
 		let state = callback.state.clone();
 		let inner_connection_handler = InnerConnectionHandler {
+			identity,
 			read_connection,
 			write_connection,
 			callback: Arc::new(callback),
@@ -170,6 +182,15 @@ impl ConnectionHandler {
 
 impl<C: ServerCallback + Send + Sync + 'static> InnerConnectionHandler<C> {
 	pub async fn start(mut self) -> Result<(), Error> {
+		let authorized = tokio::time::timeout(self.config.tls_handshake_timeout, async {
+			self.callback.callback.on_new_connection(self.address).await;
+			self.callback.callback.authorize_peer(self.id, self.address, &self.identity).await
+		})
+		.await
+		.whatever_context("Peer admission callback timed out")?;
+		if !authorized {
+			whatever!("Peer authorization denied");
+		}
 		let mut buffer = [0; MAX_APDU_FRAME_SIZE];
 		let out_buffer_full = Arc::new(AtomicBool::new(false));
 
