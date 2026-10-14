@@ -1,5 +1,10 @@
 # Changes in this fork
 
+## Unreleased — independent wire supervision
+
+- Exercise t1/t2/t3 behavior, output saturation/recovery, receive sequence wraparound and large mixed interrogation over raw TCP.
+- Add a bounded external-peer runner with same-connection STOPDT/STARTDT checks and a separate CI job using hash-pinned c104 wheels.
+
 ## Unreleased — floating-point command snapshots
 
 - Compare floating-point monitoring snapshots by representation, preserving unchanged NaN payloads while rejecting changed bits, quality or timestamps. Public numeric equality remains unchanged.

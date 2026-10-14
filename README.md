@@ -232,3 +232,20 @@ Hooks are optional but useful for consistent style:
 1. Install [pre-commit](https://pre-commit.com) (package manager or `pip install --user pre-commit`).
 2. `pre-commit autoupdate` — refresh hook revisions.
 3. `pre-commit install` — enable hooks in this clone.
+
+### Optional independent peer regression
+
+`sh tests/run_rtu_e2e.sh` builds and starts the RTU example on a temporary loopback
+port, runs `tests/test_client.py`, and always stops its own server process. It checks
+same-connection STOPDT/STARTDT, interrogation, counters, clock sync, measurements and
+command replies. Install the optional `c104` peer in a separate Python environment;
+this runner was verified with `c104==2.2.1` on CPython 3.12/Linux. `c104` is GPL-3.0
+and runs as a separate test process; it is not a library build or runtime dependency.
+
+Set `RTU_TEST_PYTHON` to that environment's interpreter. Set `RTU_TEST_SERVER` to an
+already-built RTU example executable to skip the build. The default interpreter is
+`.venv/bin/python` when it can import c104, otherwise `python3`. The runner bounds
+startup, peer execution and cleanup and never connects to a configured remote host.
+CI runs this peer in a separate job using the hash-pinned Linux x86_64 CPython
+3.11/3.12 wheels in `tests/requirements-interop.txt`. This targeted interoperability
+test does not establish full protocol conformance.

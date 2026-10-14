@@ -53,3 +53,19 @@ jobs:
           tar -xzf /tmp/cargo-udeps.tar.gz -C /tmp ./cargo-udeps-v0.1.61-x86_64-unknown-linux-gnu/cargo-udeps
           install -m 755 /tmp/cargo-udeps-v0.1.61-x86_64-unknown-linux-gnu/cargo-udeps /usr/local/cargo/bin/cargo-udeps
       - run: cargo +nightly-2026-10-13 udeps --locked --workspace --all-targets
+  interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
+    env:
+      TZ: UTC
+      RTU_TEST_PYTHON: /tmp/c104-peer/bin/python
+      # Use the container toolchain without installing editor/lint components.
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: apt-get update && apt-get install -y --no-install-recommends python3 python3-venv
+      - run: python3 -m venv /tmp/c104-peer
+      - run: |
+          /tmp/c104-peer/bin/pip install --only-binary=:all: --require-hashes -r tests/requirements-interop.txt
+      - run: sh tests/run_rtu_e2e.sh
