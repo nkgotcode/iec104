@@ -18,6 +18,11 @@ use tokio::{
 #[cfg(any(feature = "native_tls", feature = "rustls"))]
 use crate::tls::TlsServerAcceptor;
 
+// Connection tasks carry the owning server ID through every callback await.
+// A task-local ID does not keep a Server handle alive or create an ownership
+// cycle.
+tokio::task_local! { static CALLBACK_OWNER: tokio::task::Id; }
+
 /// Identifies a connection so it can be removed from the list when it
 /// terminates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -196,11 +201,13 @@ impl Server {
 	/// Queued output is discarded, not flushed. No callback runs after success.
 	/// Cancelling this future still requests shutdown; a later call can join
 	/// it. Dropping the last handle requests the same cleanup without
-	/// waiting. Calling from a callback on the server task requests shutdown
+	/// waiting. Calling from any server-owned callback requests shutdown
 	/// and returns an error; use [`Self::request_shutdown`] inside callbacks.
 	pub async fn shutdown(&self) -> Result<(), Error> {
 		self.request_shutdown();
-		if tokio::task::try_id() == Some(self.lifecycle.id) {
+		if tokio::task::try_id() == Some(self.lifecycle.id)
+			|| CALLBACK_OWNER.try_with(|owner| *owner == self.lifecycle.id).unwrap_or(false)
+		{
 			whatever!("Shutdown requested from a server callback; join from an external task");
 		}
 		let mut task = self.lifecycle.task.lock().await;

@@ -253,7 +253,7 @@ async fn client_shutdown_interrupts_reconnect_wait() {
 struct ShutdownFromCallback {
 	server: Arc<tokio::sync::Mutex<Option<Server>>>,
 	result: mpsc::UnboundedSender<bool>,
-	on_close: bool,
+	when: u8,
 }
 impl ShutdownFromCallback {
 	async fn stop(&self) {
@@ -264,32 +264,53 @@ impl ShutdownFromCallback {
 }
 #[async_trait]
 impl ServerCallback for ShutdownFromCallback {
-	async fn on_new_objects(&self, _: Asdu, _: ConnectionId, _: SocketAddr) {}
+	async fn on_new_objects(&self, _: Asdu, _: ConnectionId, _: SocketAddr) {
+		if self.when == 3 {
+			self.stop().await;
+		}
+	}
+	async fn on_connection_started(&self, _: ConnectionId, _: SocketAddr) {
+		if self.when == 2 {
+			self.stop().await;
+		}
+	}
 	async fn on_new_connection(&self, _: SocketAddr) {
-		if !self.on_close {
+		if self.when == 0 {
 			self.stop().await;
 		}
 	}
 	async fn on_connection_stopped(&self, _: ConnectionId, _: SocketAddr) {
-		if self.on_close {
+		if self.when == 1 {
 			self.stop().await;
 		}
 	}
 }
 #[tokio::test]
 async fn shutdown_from_server_callback_returns_without_self_joining() {
-	for on_close in [false, true] {
+	for when in 0..4 {
 		let slot = Arc::new(tokio::sync::Mutex::new(None));
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let (server, addr) = Server::start_with_listen_addr(
 			ServerConfig { port: 0, ..ServerConfig::default() },
-			ShutdownFromCallback { server: slot.clone(), result: tx, on_close },
+			ShutdownFromCallback { server: slot.clone(), result: tx, when },
 		)
 		.await
 		.expect("server");
 		*slot.lock().await = Some(server.clone());
-		let peer = TcpStream::connect(addr).await.expect("connect");
-		drop(peer);
+		let mut peer = TcpStream::connect(addr).await.expect("connect");
+		if when >= 2 {
+			peer.write_all(&START).await.expect("start");
+			let mut reply = [0; 6];
+			peer.read_exact(&mut reply).await.expect("start confirm");
+			if when == 3 {
+				peer.write_all(&[0x68, 14, 0, 0, 0, 0, 1, 1, 3, 0, 1, 0, 1, 0, 0, 1])
+					.await
+					.expect("ingress");
+			}
+		}
+		if when == 1 {
+			drop(peer);
+		}
 		assert_eq!(timeout(WAIT, rx.recv()).await.expect("callback must return"), Some(true));
 		timeout(WAIT, server.shutdown())
 			.await

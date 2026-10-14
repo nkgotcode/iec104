@@ -90,13 +90,14 @@ impl ConnectionHandler {
 			state: state.clone(),
 		};
 		let closed = ClosedNotification { id, tx };
-		let task = tokio::spawn(async move {
+		let owner = tokio::task::id();
+		let task = tokio::spawn(super::CALLBACK_OWNER.scope(owner, async move {
 			let _closed = closed;
 			let _ = inner_connection_handler
 				.start()
 				.await
 				.inspect_err(|e| tracing::error!("Error in running connection handler: {e}"));
-		});
+		}));
 		Self { id, address, task, tx: cmd_tx, state }
 	}
 	pub fn abort(&self) {
