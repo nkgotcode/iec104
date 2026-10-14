@@ -14,8 +14,8 @@ use iec104::{
 	asdu::Asdu,
 	config::ServerConfig,
 	rtu_server::{
-		CommandContext, CommandHandling, RtuCommandHandler, RtuHandleError, RtuInitialPoint,
-		RtuSystemHandlers, start_rtu_server_ephemeral,
+		RejectAllCommands, RtuHandleError, RtuInitialPoint, RtuResetProcessSystemHandler,
+		RtuSystemHandlers, SystemCommandContext, start_rtu_server_ephemeral,
 	},
 	server::{ConnectionId, Server, ServerCallback, error::ServerError},
 };
@@ -114,8 +114,12 @@ struct BlockCommand {
 	entered: Notify,
 }
 #[async_trait]
-impl RtuCommandHandler for BlockCommand {
-	async fn handle_command(&self, _: CommandContext<'_>) -> CommandHandling {
+impl RtuResetProcessSystemHandler for BlockCommand {
+	async fn handle_reset_process(
+		&self,
+		_: &mut SystemCommandContext<'_>,
+		_: &Server,
+	) -> Result<(), ServerError> {
 		self.entered.notify_one();
 		std::future::pending().await
 	}
@@ -126,20 +130,20 @@ async fn full_rtu_mailbox_rejects_local_work_and_closes_ingress_peer() {
 	let (rtu, addr) = start_rtu_server_ephemeral(
 		ServerConfig { rtu_queue_capacity: 2, ..ServerConfig::default() },
 		Vec::<RtuInitialPoint>::new(),
-		handler.clone(),
-		RtuSystemHandlers::default(),
+		Arc::new(RejectAllCommands),
+		RtuSystemHandlers { reset_process: handler.clone(), ..RtuSystemHandlers::default() },
 	)
 	.await
 	.expect("rtu");
 	let mut peer = started(addr).await;
 	let init = frame(&mut peer).await;
 	assert_eq!(init[6], 70);
-	peer.write_all(&[0x68, 14, 0, 0, 2, 0, 45, 1, 6, 0, 1, 0, 1, 0, 0, 1])
+	peer.write_all(&[0x68, 14, 0, 0, 2, 0, 105, 1, 6, 0, 1, 0, 1, 0, 0, 1])
 		.await
 		.expect("first command");
 	timeout(WAIT, handler.entered.notified()).await.expect("handler entered");
 	for sequence in 1..=3 {
-		peer.write_all(&[0x68, 14, sequence * 2, 0, 2, 0, 45, 1, 6, 0, 1, 0, 1, 0, 0, 1])
+		peer.write_all(&[0x68, 14, sequence * 2, 0, 2, 0, 105, 1, 6, 0, 1, 0, 1, 0, 0, 1])
 			.await
 			.expect("queued command");
 	}

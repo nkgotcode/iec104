@@ -1,5 +1,13 @@
 # Changes in this fork
 
+## Unreleased — command lifecycle
+
+- Add bounded deferred command preparation/completion without blocking telemetry or interrogation; positive ACT_TERM is sent only on success.
+- Add permanent session cancellation, guarded replies and joined shutdown of command futures. Accepted failures/timeouts close the peer instead of claiming success.
+- Add optional bounded SelectBeforeExecute/SelectionState policies with expiry, ownership, exact matching and one-use execution.
+- Validate model updates atomically; reject stale immediate updates, unsupported multi-object/test/Request process commands and concurrent commands from the same peer.
+- Add command_timeout configuration and synchronous nonblocking connection-close notifications for cancellation.
+
 ## Unreleased — session continuity
 
 - Retain sequence, acknowledgement and pending-output state across STOPDT/STARTDT on one TCP connection, including coalesced input.

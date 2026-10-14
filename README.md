@@ -84,6 +84,48 @@ Client reconnection creates fresh sequence state and rejects queued commands
 from the previous connection. There is no implicit command replay across a
 connection loss. A successful local send is not proof of remote execution.
 
+## Deferred commands and selection
+
+Override `RtuCommandHandler::prepare_command` to return either an immediate
+`CommandHandling` result or `CommandDispatch::Deferred(DeferredCommand::new(...))`.
+Preparation must not actuate. The deferred future is first polled after a positive
+ACT_CON enters the link queue; successful completion emits ACT_TERM. This is local
+admission, not proof that the peer has received the confirmation. Existing
+`handle_command` implementations remain supported as immediate handlers.
+
+Command work is bounded by `command_capacity`, with at most one in flight per
+connection. Telemetry and interrogation continue while a command future waits.
+`command_timeout` (default 10 seconds) applies separately to preparation and
+execution. Preparation timeout rejects the command. Failure, panic, invalid
+completion updates or timeout after acceptance closes the connection; it never
+claims successful completion or invents a type-independent negative ACT_TERM.
+Connection loss means the external outcome may be unknown. The application must
+implement its own recovery and idempotency policy before retrying an operation.
+
+`CommandContext::session` is permanently cancelled on STOPDT, disconnect or
+shutdown. Restart creates a fresh session token. Owned futures are cancelled and
+joined during shutdown, and guarded replies queued behind a full transmit window
+cannot leak into a restarted session. Dropping a future cannot undo an external
+action already performed: adapters must honour cancellation and must not detach
+untracked actuator tasks.
+
+Preparation sees a model snapshot. Immediate updates are rejected if their target
+has changed since that snapshot; all updates are validated before mutation.
+Negative replies never apply updates. Commands must contain one object; test,
+negative and Request-COT process commands are rejected without invoking execution.
+
+Wrap a handler with `SelectBeforeExecute::new(handler, timeout, capacity)` for
+mandatory selection. The handler must explicitly authorize `select` without
+actuating. Reservations are bounded, expire, belong to one data-transfer session,
+and are consumed once. Type, common address, IOA, originator, value, qualifier and
+timestamp must match exactly except for the S/E bit. Wrong-master/value/address
+executions, expired selections and duplicate executes are rejected. Deactivation
+cancels a matching reservation. Bitstring commands have no S/E field and are
+rejected by this wrapper. `SelectionState` is also available for custom policies.
+
+These mechanisms provide protocol lifecycle management, not application
+permission checks, interlocks or equipment safety logic.
+
 ## Explicit system-command policy
 
 `RtuSystemHandlers::monitoring_only()` allows test/read requests and ordinary

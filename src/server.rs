@@ -77,6 +77,12 @@ pub trait ServerCallback {
 	async fn on_connection_stopped(&self, id: ConnectionId, address: SocketAddr) {
 		tracing::debug!("Connection {id:?} from {address} stopped");
 	}
+	/// Synchronous close notification, including task cancellation. Must not
+	/// block or panic. Use it to invalidate session tokens before queued work
+	/// runs; use `on_connection_disconnected` for asynchronous
+	/// notifications.
+	fn on_connection_closed(&self, _id: ConnectionId, _address: SocketAddr) {}
+
 	/// TCP session ended, distinct from a STOPDT transition.
 	async fn on_connection_disconnected(&self, id: ConnectionId, address: SocketAddr) {
 		tracing::debug!("Connection {id:?} from {address} disconnected");
@@ -129,9 +135,15 @@ impl<C: ServerCallback + Send + Sync> InnerServerCallback<C> {
 /// Commands for the server to send to the inner server
 #[derive(Debug)]
 pub enum ServerCommand {
+	/// Close one TCP session without replaying its queued output.
+	Disconnect {
+		id: ConnectionId,
+		tx: oneshot::Sender<Result<(), error::ServerError>>,
+	},
 	SingleConnection {
 		id: ConnectionId,
 		asdu: Asdu,
+		guard: Option<watch::Receiver<bool>>,
 		tx: oneshot::Sender<Result<(), error::ServerError>>,
 	},
 	Broadcast {
@@ -247,14 +259,36 @@ impl Server {
 		self.lifecycle.stop.send_replace(());
 	}
 
+	/// Request closure of one connection. Cancellation is requested before
+	/// success; server shutdown can be used to join all connection tasks.
+	pub async fn disconnect(&self, id: ConnectionId) -> Result<(), error::ServerError> {
+		let (tx, rx) = oneshot::channel();
+		self.tx.send(ServerCommand::Disconnect { id, tx }).await.context(error::SendCommand)?;
+		rx.await.context(error::ReceiveResponse)?
+	}
+
 	pub async fn send_asdu(&self, id: ConnectionId, asdu: Asdu) -> Result<(), error::ServerError> {
 		let (tx, rx) = oneshot::channel();
 		self.tx
-			.send(ServerCommand::SingleConnection { id, asdu, tx })
+			.send(ServerCommand::SingleConnection { id, asdu, guard: None, tx })
 			.await
 			.context(error::SendCommand)?;
 		rx.await.context(error::ReceiveResponse)?
 	}
+	pub(crate) async fn send_asdu_guarded(
+		&self,
+		id: ConnectionId,
+		asdu: Asdu,
+		guard: watch::Receiver<bool>,
+	) -> Result<(), error::ServerError> {
+		let (tx, rx) = oneshot::channel();
+		self.tx
+			.send(ServerCommand::SingleConnection { id, asdu, guard: Some(guard), tx })
+			.await
+			.context(error::SendCommand)?;
+		rx.await.context(error::ReceiveResponse)?
+	}
+
 	pub async fn broadcast_asdu(&self, asdu: Asdu) -> Result<(), error::ServerError> {
 		let (tx, rx) = oneshot::channel();
 		self.tx.send(ServerCommand::Broadcast { asdu, tx }).await.context(error::SendCommand)?;
@@ -311,10 +345,22 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 	}
 
 	fn dispatch(&mut self, command: ServerCommand) {
+		if let ServerCommand::Disconnect { id, tx } = command {
+			let result = match self.connections.get(&id) {
+				Some(peer) => {
+					peer.abort();
+					Ok(())
+				}
+				None => error::ConnectionNotFound { id }.fail(),
+			};
+			let _ = tx.send(result);
+			return;
+		}
 		if self.deliveries.len() >= self.config.command_capacity {
 			let tx = match command {
 				ServerCommand::SingleConnection { tx, .. }
-				| ServerCommand::Broadcast { tx, .. } => tx,
+				| ServerCommand::Broadcast { tx, .. }
+				| ServerCommand::Disconnect { tx, .. } => tx,
 			};
 			let _ = tx.send(error::Overloaded.fail());
 			return;
@@ -323,9 +369,10 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 		let mut replies = Vec::new();
 		let mut result = Ok(());
 		let tx = match command {
-			ServerCommand::SingleConnection { id, asdu, tx } => {
+			ServerCommand::Disconnect { .. } => return,
+			ServerCommand::SingleConnection { id, asdu, guard, tx } => {
 				match self.connections.get(&id) {
-					Some(peer) => match peer.enqueue_asdu(asdu) {
+					Some(peer) => match peer.enqueue_asdu(asdu, guard) {
 						Ok(rx) => replies.push((rx, peer.task.abort_handle())),
 						Err(error) => result = Err(error),
 					},
@@ -335,7 +382,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 			}
 			ServerCommand::Broadcast { asdu, tx } => {
 				for peer in self.connections.values().filter(|peer| peer.is_started()) {
-					match peer.enqueue_asdu(asdu.clone()) {
+					match peer.enqueue_asdu(asdu.clone(), None) {
 						Ok(rx) => replies.push((rx, peer.task.abort_handle())),
 						Err(error) => {
 							if result.is_ok() {
@@ -442,5 +489,75 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod guarded_output_tests {
+	use std::time::Duration;
+
+	use tokio::{
+		io::{AsyncReadExt, AsyncWriteExt},
+		net::TcpStream,
+	};
+
+	use super::*;
+	struct Capture(mpsc::UnboundedSender<ConnectionId>);
+	#[async_trait::async_trait]
+	impl ServerCallback for Capture {
+		async fn on_new_objects(&self, _: Asdu, _: ConnectionId, _: SocketAddr) {}
+		async fn on_connection_started(&self, id: ConnectionId, _: SocketAddr) {
+			let _ = self.0.send(id);
+		}
+	}
+	async fn frame(peer: &mut TcpStream) -> Vec<u8> {
+		let mut h = [0; 2];
+		peer.read_exact(&mut h).await.expect("header");
+		let mut b = vec![0; usize::from(h[1]) + 2];
+		b[..2].copy_from_slice(&h);
+		peer.read_exact(&mut b[2..]).await.expect("body");
+		b
+	}
+	#[tokio::test]
+	async fn cancelled_guarded_output_is_not_replayed_after_startdt() {
+		tokio::time::timeout(Duration::from_secs(3), async {
+			let (tx, mut rx) = mpsc::unbounded_channel();
+			let mut config = ServerConfig { port: 0, ..Default::default() };
+			config.protocol.k = 3;
+			config.protocol.w = 2;
+			let (server, addr) =
+				Server::start_with_listen_addr(config, Capture(tx)).await.expect("server");
+			let mut peer = TcpStream::connect(addr).await.expect("peer");
+			peer.write_all(&[0x68, 4, 7, 0, 0, 0]).await.expect("start");
+			assert_eq!(frame(&mut peer).await, [0x68, 4, 11, 0, 0, 0]);
+			let id = rx.recv().await.expect("id");
+			let sample = Asdu::parse(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 1]).expect("sample");
+			for _ in 0..3 {
+				server.send_asdu(id, sample.clone()).await.expect("fill window");
+			}
+			for seq in 0..3 {
+				assert_eq!(frame(&mut peer).await[2], seq * 2);
+			}
+			let (active, guard) = watch::channel(true);
+			server.send_asdu_guarded(id, sample, guard).await.expect("queued guarded output");
+			active.send_replace(false);
+			peer.write_all(&[0x68, 4, 0x13, 0, 0, 0, 0x68, 4, 1, 0, 6, 0, 0x68, 4, 7, 0, 0, 0])
+				.await
+				.expect("stop ack restart");
+			assert_eq!(frame(&mut peer).await, [0x68, 4, 0x23, 0, 0, 0]);
+			assert_eq!(frame(&mut peer).await, [0x68, 4, 11, 0, 0, 0]);
+			rx.recv().await.expect("restarted");
+			server
+				.send_asdu(id, Asdu::parse(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 0]).expect("fresh sample"))
+				.await
+				.expect("fresh send");
+			let received = frame(&mut peer).await;
+			assert_eq!(received[2], 6);
+			assert_eq!(received[15], 0, "old guarded output was discarded");
+			server.shutdown().await.expect("shutdown");
+		})
+		.await
+		.expect("test deadline");
 	}
 }

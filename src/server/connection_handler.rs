@@ -47,11 +47,15 @@ impl Drop for ConnectionHandler {
 }
 
 struct ClosedNotification {
+	on_close: Option<Box<dyn FnOnce() + Send>>,
 	id: ConnectionId,
 	tx: mpsc::UnboundedSender<ConnectionId>,
 }
 impl Drop for ClosedNotification {
 	fn drop(&mut self) {
+		if let Some(on_close) = self.on_close.take() {
+			on_close();
+		}
 		let _ = self.tx.send(self.id);
 	}
 }
@@ -89,7 +93,12 @@ impl ConnectionHandler {
 			address,
 			state: state.clone(),
 		};
-		let closed = ClosedNotification { id, tx };
+		let callback = inner_connection_handler.callback.clone();
+		let closed = ClosedNotification {
+			id,
+			tx,
+			on_close: Some(Box::new(move || callback.callback.on_connection_closed(id, address))),
+		};
 		let owner = tokio::task::id();
 		let task = tokio::spawn(super::CALLBACK_OWNER.scope(owner, async move {
 			let _closed = closed;
@@ -114,13 +123,18 @@ impl ConnectionHandler {
 	pub fn enqueue_asdu(
 		&self,
 		asdu: Asdu,
+		guard: Option<tokio::sync::watch::Receiver<bool>>,
 	) -> Result<oneshot::Receiver<Result<(), SendAsduQueueError>>, error::ServerError> {
 		if !self.is_started() {
 			return error::NotStarted.fail();
 		}
 		let (reply_tx, reply_rx) = oneshot::channel();
-		match self.tx.try_send(ReceiveHandlerCommand::Asdu { asdu, session: None, reply: reply_tx })
-		{
+		match self.tx.try_send(ReceiveHandlerCommand::Asdu {
+			asdu,
+			session: None,
+			guard,
+			reply: reply_tx,
+		}) {
 			Ok(()) => Ok(reply_rx),
 			Err(mpsc::error::TrySendError::Full(_)) => error::Overloaded.fail(),
 			Err(mpsc::error::TrySendError::Closed(cmd)) => {
