@@ -256,3 +256,28 @@ async fn test_confirmation_cannot_cancel_stop_confirmation_deadline() {
 		.expect("accept replacement");
 	client.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn rtu_retries_initialization_after_immediate_stop() {
+	use iec104::rtu_server::{
+		RejectAllCommands, RtuInitialPoint, RtuSystemHandlers, start_rtu_server_ephemeral,
+	};
+	let (rtu, addr) = start_rtu_server_ephemeral(
+		ServerConfig::default(),
+		Vec::<RtuInitialPoint>::new(),
+		std::sync::Arc::new(RejectAllCommands),
+		RtuSystemHandlers::default(),
+	)
+	.await
+	.expect("rtu");
+	let mut peer = TcpStream::connect(addr).await.expect("peer");
+	peer.write_all(&[0x68, 4, 7, 0, 0, 0, 0x68, 4, 0x13, 0, 0, 0]).await.expect("start and stop");
+	assert_eq!(frame(&mut peer).await, [0x68, 4, 11, 0, 0, 0]);
+	assert_eq!(frame(&mut peer).await, [0x68, 4, 0x23, 0, 0, 0]);
+	// This actor operation is a barrier after the initial STARTDT notification.
+	rtu.unregister_all().await.expect("actor barrier");
+	peer.write_all(&[0x68, 4, 7, 0, 0, 0]).await.expect("restart");
+	assert_eq!(frame(&mut peer).await, [0x68, 4, 11, 0, 0, 0]);
+	assert_eq!(frame(&mut peer).await[6], 70);
+	rtu.shutdown().await.expect("shutdown");
+}

@@ -57,6 +57,7 @@ pub(crate) enum ActorMsg {
 	/// TCP + STARTDT completed; send [`TypeId::M_EI_NA_1`] to this peer.
 	ConnectionStarted {
 		connection_id: ConnectionId,
+		initialized: Arc<std::sync::atomic::AtomicBool>,
 	},
 }
 
@@ -89,13 +90,13 @@ pub(crate) enum RegisterPointError {
 
 #[derive(Clone)]
 pub(super) struct NetworkIngress {
-	initialized: Arc<std::sync::Mutex<HashSet<ConnectionId>>>,
+	initialized: Arc<std::sync::Mutex<HashMap<ConnectionId, Arc<std::sync::atomic::AtomicBool>>>>,
 	tx: tokio::sync::mpsc::Sender<ActorMsg>,
 }
 
 impl NetworkIngress {
 	pub(super) fn new(tx: tokio::sync::mpsc::Sender<ActorMsg>) -> Self {
-		Self { tx, initialized: Arc::new(std::sync::Mutex::new(HashSet::new())) }
+		Self { tx, initialized: Arc::new(std::sync::Mutex::new(HashMap::new())) }
 	}
 }
 
@@ -123,11 +124,14 @@ impl ServerCallback for NetworkIngress {
 		use snafu::ResultExt as _;
 		let mut initialized =
 			self.initialized.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		if !initialized.contains(&connection_id) {
+		let initialized = initialized.entry(connection_id).or_default();
+		if !initialized.load(std::sync::atomic::Ordering::Relaxed) {
 			self.tx
-				.try_send(ActorMsg::ConnectionStarted { connection_id })
+				.try_send(ActorMsg::ConnectionStarted {
+					connection_id,
+					initialized: initialized.clone(),
+				})
 				.whatever_context("RTU ingress unavailable or overloaded")?;
-			initialized.insert(connection_id);
 		}
 		Ok(())
 	}
@@ -209,8 +213,12 @@ pub(super) async fn run_actor(
 				)
 				.await;
 			}
-			ActorMsg::ConnectionStarted { connection_id } => {
-				send_end_of_initialization(&model, &server, connection_id).await;
+			ActorMsg::ConnectionStarted { connection_id, initialized } => {
+				if !initialized.load(std::sync::atomic::Ordering::Relaxed)
+					&& send_end_of_initialization(&model, &server, connection_id).await
+				{
+					initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+				}
 			}
 		}
 	}
@@ -304,15 +312,14 @@ async fn send_end_of_initialization(
 	model: &HashMap<PointAddress, PointValue>,
 	server: &Server,
 	connection_id: ConnectionId,
-) {
+) -> bool {
 	let ca = station_common_address(model);
-	let asdu = end_of_initialization_asdu(ca);
-	if let Err(e) = server.send_asdu(connection_id, asdu).await {
-		tracing::warn!(
-			error = ?e,
-			?connection_id,
-			"failed to send M_EI_NA_1 (end of initialization)"
-		);
+	match server.send_asdu(connection_id, end_of_initialization_asdu(ca)).await {
+		Ok(()) => true,
+		Err(error) => {
+			tracing::debug!(%error,"Initialization not admitted; retry on next STARTDT");
+			false
+		}
 	}
 }
 
