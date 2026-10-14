@@ -88,8 +88,14 @@ async fn main() -> Result<(), Whatever> {
 		.expect("IOA 40: group 2 interrogation"),
 	];
 
+	let port = std::env::var("IEC104_PORT")
+		.ok()
+		.map(|s| s.parse::<u16>())
+		.transpose()
+		.whatever_context("Invalid IEC104_PORT")?
+		.unwrap_or(2404);
 	let rtu = RtuServer::start(
-		ServerConfig::default(),
+		ServerConfig { port, ..ServerConfig::default() },
 		initial_points,
 		Arc::new(MapCommandsToSameIoaMonitoring),
 	)

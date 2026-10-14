@@ -124,6 +124,23 @@ def _run_rtu_server_feature_checks(monitor_conn: c104.Connection) -> bool:
     """
     ok = True
 
+    original_session = monitor_conn.connected_at
+    print("  same-connection STOPDT / STARTDT...")
+    if not monitor_conn.mute():
+        return False
+    deadline = time.monotonic() + 3
+    while not monitor_conn.is_muted and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not monitor_conn.is_muted or not monitor_conn.unmute():
+        return False
+    deadline = time.monotonic() + 3
+    while monitor_conn.is_muted and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if monitor_conn.is_muted or monitor_conn.connected_at != original_session:
+        return False
+    if not monitor_conn.interrogation(common_address=47, cause=c104.Cot.ACTIVATION, qualifier=c104.Qoi.STATION):
+        return False
+
     if not hasattr(monitor_conn, "clock_sync"):
         print("  skip: connection has no clock_sync (c104 too old?)")
     else:

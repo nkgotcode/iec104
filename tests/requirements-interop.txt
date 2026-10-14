@@ -1,0 +1,4 @@
+# Independent test peer: Linux x86_64 wheels for CPython 3.11 and 3.12.
+c104==2.2.1 \
+    --hash=sha256:afbe7698e75368bc83c8a476464f922403807eb3a259d9e074d4ce30738106b6 \
+    --hash=sha256:0a91df4a1d746898a2ebb035da7e2d0a816a1446e4d6822f0a8b962aecc556a3
