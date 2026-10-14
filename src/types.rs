@@ -27,6 +27,12 @@ pub trait FromBytes: Sized {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum ParseError {
+	#[snafu(display("Invalid or nonconsecutive information object address"))]
+	InvalidAddress {
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+
 	#[snafu(display("Time conversion error"))]
 	ParseTimeTag {
 		source: ParseTimeError,

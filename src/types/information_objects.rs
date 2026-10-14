@@ -4,7 +4,6 @@
 //! its `TypeId` / payload pairs aligned with the matching rows here when you
 //! extend either side.
 
-use snafu::OptionExt;
 use tracing::instrument;
 
 use super::{
@@ -55,32 +54,28 @@ macro_rules! define_information_objects {
 					bytes
 				);
 
+				let expected = if sequence {
+					ADDRESS_SIZE + usize::from(num_objs) * object_size
+				} else {
+					usize::from(num_objs) * (ADDRESS_SIZE + object_size)
+				};
+				if bytes.len() != expected || (sequence && num_objs == 0) {
+					return NotEnoughBytes.fail();
+				}
 				if sequence {
-					let mut objs = Vec::<GenericObject<T>>::with_capacity(num_objs as usize);
-					let (first_chunk, other_chunks) = bytes
-						.split_at_checked(object_size + ADDRESS_SIZE)
-						.context(NotEnoughBytes)?;
-
-					let first_addr =
-						u32::from_le_bytes([first_chunk[0], first_chunk[1], first_chunk[2], 0]);
-					let first_obj = T::from_bytes(&first_chunk[ADDRESS_SIZE..])?;
-					objs.push(GenericObject { address: first_addr, object: first_obj });
-					let other_chunks = other_chunks.chunks_exact(object_size);
-					if !other_chunks.remainder().is_empty() {
-						return NotEnoughBytes.fail();
+					let first_addr = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+					if first_addr + u32::from(num_objs) - 1 > 0x00ff_ffff {
+						return super::InvalidAddress.fail();
 					}
-
-					let other_objs = other_chunks
-						.enumerate()
-						.map(|(i, chunk)| {
-							tracing::trace!("Building object: {:?}", chunk);
-							let address = first_addr + (i as u32) + 1;
-							let object = T::from_bytes(chunk)?;
-							Ok(GenericObject { address, object })
+					// Index by count rather than chunks_exact: read-command objects
+					// have zero payload bytes and must never cause a zero-chunk panic.
+					(0..num_objs).map(|i| {
+						let start = ADDRESS_SIZE + usize::from(i) * object_size;
+						Ok(GenericObject {
+							address: first_addr + u32::from(i),
+							object: T::from_bytes(&bytes[start..start + object_size])?,
 						})
-						.collect::<Result<Vec<_>, ParseError>>()?;
-					objs.extend(other_objs);
-					Ok::<_, ParseError>(objs)
+					}).collect::<Result<Vec<_>, ParseError>>()
 				} else {
 					// `chunks_exact` rejects a short trailing chunk; pre-fix
 					// `chunks` would yield it and panic on `chunk[2]`. The
@@ -103,13 +98,19 @@ macro_rules! define_information_objects {
 			#[instrument(skip_all)]
 			fn serialize_objects<T: FromBytes + ToBytes + Default>(
 				objects: &[GenericObject<T>],
+				sequence: bool,
 				buffer: &mut Vec<u8>,
 			) -> Result<(), ParseError> {
-				for obj in objects {
-					let address = obj.address.to_le_bytes();
-					buffer.push(address[0]);
-					buffer.push(address[1]);
-					buffer.push(address[2]);
+				if sequence && objects.is_empty() { return NotEnoughBytes.fail(); }
+				for (index, obj) in objects.iter().enumerate() {
+					if obj.address > 0x00ff_ffff
+						|| (sequence && objects[0].address.checked_add(index as u32) != Some(obj.address))
+					{
+						return super::InvalidAddress.fail();
+					}
+					if !sequence || index == 0 {
+						buffer.extend_from_slice(&obj.address.to_le_bytes()[..ADDRESS_SIZE]);
+					}
 					obj.object.to_bytes(buffer)?;
 				}
 				Ok(())
@@ -158,10 +159,22 @@ macro_rules! define_information_objects {
 				}
 			}
 
+			pub(crate) fn to_asdu_bytes(
+				&self, type_id: TypeId, sequence: bool, buffer: &mut Vec<u8>,
+			) -> Result<(), ParseError> {
+				match self {
+					$( Self::$variant(objs) if type_id == TypeId::$type_id =>
+						Self::serialize_objects(objs, sequence, buffer), )*
+					Self::Raw(objs) if !type_id.is_standard() =>
+						Self::serialize_objects(objs, sequence, buffer),
+					_ => super::InvalidType.fail(),
+				}
+			}
+
 			pub fn to_bytes(&self, buffer: &mut Vec<u8>) -> Result<(), ParseError> {
 				match self {
-					$( Self::$variant(objs) => Self::serialize_objects(objs, buffer), )*
-					Self::Raw(objs) => Self::serialize_objects(objs, buffer),
+					$( Self::$variant(objs) => Self::serialize_objects(objs, false, buffer), )*
+					Self::Raw(objs) => Self::serialize_objects(objs, false, buffer),
 				}
 			}
 		}

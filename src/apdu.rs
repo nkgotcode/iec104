@@ -34,7 +34,9 @@ impl Apdu {
 
 		let length = data[1];
 
-		if length > APUD_MAX_LENGTH {
+		if !(CONTROL_FIELDS_SIZE as u8..=APUD_MAX_LENGTH).contains(&length)
+			|| data.len() != APDU_HEADER_SIZE + usize::from(length)
+		{
 			return error::InvalidLength.fail();
 		}
 
@@ -50,12 +52,10 @@ impl Apdu {
 	}
 
 	pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-		// The total length of the APDU is the length of the frame plus the
-		// start byte and the length octet
-		let mut bytes = Vec::with_capacity(self.length as usize + APDU_HEADER_SIZE);
-		bytes.push(TELEGRAM_HEADER);
-		bytes.push(self.length);
-		self.frame.to_bytes(&mut bytes)?;
+		let bytes = self.frame.to_apdu_bytes()?;
+		if bytes[1] != self.length {
+			return error::InvalidLength.fail();
+		}
 		Ok(bytes)
 	}
 }
@@ -133,6 +133,9 @@ impl IFrame {
 	}
 
 	fn to_bytes(&self, buffer: &mut Vec<u8>) -> Result<(), Error> {
+		if self.receive_sequence_number >= 32768 || self.send_sequence_number >= 32768 {
+			return error::InvalidIFrameControlFields.fail();
+		}
 		let rsn = (self.receive_sequence_number << 1).to_le_bytes();
 		let ssn = (self.send_sequence_number << 1).to_le_bytes();
 		buffer.push(ssn[0]);
@@ -158,7 +161,10 @@ pub struct SFrame {
 impl SFrame {
 	#[instrument]
 	fn from_control_fields(control_fields: [u8; CONTROL_FIELDS_SIZE]) -> Result<Self, Error> {
-		if control_fields[0] != 0b0000_0001 || control_fields[1] != 0b0000_0000 {
+		if control_fields[0] != 0b0000_0001
+			|| control_fields[1] != 0b0000_0000
+			|| control_fields[2] & 1 != 0
+		{
 			return error::InvalidSFrameControlFields.fail();
 		}
 		Ok(Self {
@@ -169,6 +175,9 @@ impl SFrame {
 	}
 
 	fn to_bytes(&self, buffer: &mut Vec<u8>) -> Result<(), Error> {
+		if self.receive_sequence_number >= 32768 {
+			return error::InvalidSFrameControlFields.fail();
+		}
 		let rsn = (self.receive_sequence_number << 1).to_le_bytes();
 		buffer.push(0b0000_0001);
 		buffer.push(0b0000_0000);
@@ -206,7 +215,11 @@ pub struct UFrame {
 impl UFrame {
 	#[instrument]
 	fn from_control_fields(control_fields: [u8; CONTROL_FIELDS_SIZE]) -> Result<Self, Error> {
-		if control_fields[1] != 0 || control_fields[2] != 0 || control_fields[3] != 0 {
+		if !matches!(control_fields[0], 7 | 11 | 19 | 35 | 67 | 131)
+			|| control_fields[1] != 0
+			|| control_fields[2] != 0
+			|| control_fields[3] != 0
+		{
 			return error::InvalidUFrameControlFields.fail();
 		}
 		Ok(Self {
@@ -240,6 +253,9 @@ impl UFrame {
 		}
 		if self.test_fr_confirmation {
 			byte |= 0b1000_0000;
+		}
+		if !matches!(byte, 7 | 11 | 19 | 35 | 67 | 131) {
+			return error::InvalidUFrameControlFields.fail();
 		}
 		buffer.push(byte);
 		buffer.push(0);

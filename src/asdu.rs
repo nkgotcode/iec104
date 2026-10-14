@@ -118,7 +118,9 @@ impl Asdu {
 		buffer.push(address_field[0]);
 		buffer.push(address_field[1]);
 
-		self.information_objects.to_bytes(buffer).context(InvalidInformationObject)?;
+		self.information_objects
+			.to_asdu_bytes(self.type_id, self.sequence, buffer)
+			.context(InvalidInformationObject)?;
 		Ok(())
 	}
 }
