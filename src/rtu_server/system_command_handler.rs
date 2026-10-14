@@ -180,6 +180,19 @@ impl Default for RtuSystemHandlers {
 }
 
 impl RtuSystemHandlers {
+	/// Read-only model access: allow test, read and ordinary counter reads;
+	/// reject clock synchronization, reset process and counter freeze/reset.
+	/// Combine with [`super::RejectAllCommands`] to reject process commands.
+	/// Unlike the defaults, this preset never acknowledges clock/reset actions
+	/// as successful. It does not authorize peers or enforce network access.
+	#[must_use]
+	pub fn monitoring_only() -> Self {
+		Self::default()
+			.with_clock_sync(Arc::new(RejectClockSync))
+			.with_reset_process(Arc::new(RejectResetProcess))
+			.with_counter_interrogation(Arc::new(ReadOnlyCounterInterrogation))
+	}
+
 	#[must_use]
 	pub fn with_test(mut self, test: Arc<dyn RtuTestSystemHandler>) -> Self {
 		self.test = test;
@@ -480,5 +493,108 @@ impl RtuResetProcessSystemHandler for DefaultRtuResetProcessSystemHandler {
 		)
 		.await?;
 		Ok(())
+	}
+}
+
+/// Reject valid clock synchronization requests without changing the stored
+/// clock. Empty or mismatched payloads are ignored, as in the default handler.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RejectClockSync;
+
+#[async_trait::async_trait]
+impl RtuClockSyncSystemHandler for RejectClockSync {
+	async fn handle_clock_sync(
+		&self,
+		ctx: &mut SystemCommandContext<'_>,
+		server: &Server,
+	) -> Result<(), ServerError> {
+		let InformationObjects::CCsNa1(objects) = &ctx.asdu.information_objects else {
+			return Ok(());
+		};
+		if objects.is_empty()
+			|| ctx.asdu.type_id != TypeId::C_CS_NA_1
+			|| !is_system_command_cot(ctx.asdu.cot)
+		{
+			return Ok(());
+		}
+		send_command_confirmation(
+			server,
+			ctx.connection_id,
+			ctx.asdu,
+			TypeId::C_CS_NA_1,
+			ctx.asdu.information_objects.clone(),
+			true,
+		)
+		.await
+	}
+}
+
+/// Reject reset-process requests without changing the model or invoking a
+/// reset. Empty or mismatched payloads are ignored, as in the default handler.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RejectResetProcess;
+
+#[async_trait::async_trait]
+impl RtuResetProcessSystemHandler for RejectResetProcess {
+	async fn handle_reset_process(
+		&self,
+		ctx: &mut SystemCommandContext<'_>,
+		server: &Server,
+	) -> Result<(), ServerError> {
+		let InformationObjects::CRpNa1(objects) = &ctx.asdu.information_objects else {
+			return Ok(());
+		};
+		if objects.is_empty()
+			|| ctx.asdu.type_id != TypeId::C_RP_NA_1
+			|| !is_system_command_cot(ctx.asdu.cot)
+		{
+			return Ok(());
+		}
+		send_command_confirmation(
+			server,
+			ctx.connection_id,
+			ctx.asdu,
+			TypeId::C_RP_NA_1,
+			ctx.asdu.information_objects.clone(),
+			true,
+		)
+		.await
+	}
+}
+
+/// Allow ordinary counter reads; reject freeze, freeze-and-reset and reset.
+/// Rejected requests echo the request with a negative confirmation, without
+/// counter data, termination or model mutation. Malformed payloads are ignored.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReadOnlyCounterInterrogation;
+
+#[async_trait::async_trait]
+impl RtuCounterInterrogationHandler for ReadOnlyCounterInterrogation {
+	async fn handle_counter_interrogation(
+		&self,
+		ctx: &mut CounterInterrogationContext<'_>,
+		server: &Server,
+	) -> Result<(), ServerError> {
+		let InformationObjects::CCiNa1(objects) = &ctx.asdu.information_objects else {
+			return Ok(());
+		};
+		if objects.is_empty()
+			|| ctx.asdu.type_id != TypeId::C_CI_NA_1
+			|| !is_system_command_cot(ctx.asdu.cot)
+		{
+			return Ok(());
+		}
+		if objects.iter().any(|o| o.object.frz != Frz::Read) {
+			return send_command_confirmation(
+				server,
+				ctx.connection_id,
+				ctx.asdu,
+				TypeId::C_CI_NA_1,
+				ctx.asdu.information_objects.clone(),
+				true,
+			)
+			.await;
+		}
+		DefaultRtuCounterInterrogationHandler.handle_counter_interrogation(ctx, server).await
 	}
 }

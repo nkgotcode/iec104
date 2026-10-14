@@ -4,6 +4,7 @@
 
 Based on upstream 0.5.1, commit `162cbead586de10d2a22687ab9d4f5b30946091c`.
 
+- Add opt-in clock/reset rejection and read-only counter presets, with a monitoring-only composition, example and wire-level regression tests. Existing defaults remain unchanged.
 - Isolate TLS handshakes from the listener loop, enforce a handshake deadline, and keep failed peers from stopping the listener. Client TLS setup also has a deadline.
 - Bound accepted sockets (including handshakes) to 64 by default. `ServerConfig` adds `max_connections` and `tls_handshake_timeout`; serialized configs have defaults, while exhaustive Rust literals must be updated.
 - Add awaited, idempotent shutdown to server, client and RTU handles. Cancel and join I/O, callbacks and reconnect work; last-handle drop requests cancellation. Pending output is discarded.
