@@ -19,7 +19,8 @@ use tokio::{
 use tracing::instrument;
 
 use crate::{
-	Connection, STOP_DT_ACT_FRAME, STOP_DT_CON_FRAME, TEST_FR_ACT_FRAME, TEST_FR_CON_FRAME,
+	Connection, START_DT_ACT_FRAME, START_DT_CON_FRAME, STOP_DT_ACT_FRAME, STOP_DT_CON_FRAME,
+	TEST_FR_ACT_FRAME, TEST_FR_CON_FRAME,
 	apdu::{
 		APDU_HEADER_SIZE, APUD_MAX_LENGTH, Apdu, Frame, IFrame, MAX_APDU_FRAME_SIZE, SFrame,
 		TELEGRAM_HEADER, UFrame,
@@ -138,6 +139,8 @@ pub enum SendAsduQueueError {
 	/// [`ProtocolConfig::max_pending_outgoing_asdu`](crate::config::ProtocolConfig::max_pending_outgoing_asdu)
 	/// non-zero limit reached (waiting for `k` window / peer acks).
 	PendingBufferFull,
+	/// Data transfer is stopped or a stop is pending.
+	NotStarted,
 }
 
 /// Payload for [`ReceiveHandlerCommand::Asdu`]'s `reply` oneshot.
@@ -145,10 +148,10 @@ pub type SendAsduCommandAck = Result<(), SendAsduQueueError>;
 
 #[derive(Debug)]
 pub enum ReceiveHandlerCommand {
-	Start,
-	Stop,
-	Test,
-	Asdu { asdu: Asdu, reply: oneshot::Sender<SendAsduCommandAck> },
+	Start { session: u64 },
+	Stop { session: u64 },
+	Test { session: u64 },
+	Asdu { asdu: Asdu, session: Option<u64>, reply: oneshot::Sender<SendAsduCommandAck> },
 }
 
 #[async_trait::async_trait]
@@ -158,6 +161,7 @@ pub enum ReceiveHandlerCommand {
 )]
 pub trait ReceiveHandlerCallback: Send + Sync {
 	async fn on_new_objects(&self, asdu: Asdu) -> Result<(), Error>;
+	async fn on_data_transfer(&self, active: bool) -> Result<(), Error>;
 }
 
 pub struct ReceiveHandler<'a, C: ReceiveHandlerCallback> {
@@ -168,6 +172,10 @@ pub struct ReceiveHandler<'a, C: ReceiveHandlerCallback> {
 	rx: &'a mut mpsc::Receiver<ReceiveHandlerCommand>,
 	out_buffer_full: Arc<AtomicBool>,
 	t1_u: Pin<Box<tokio::time::Sleep>>,
+	t1_transfer: Pin<Box<tokio::time::Sleep>>,
+	active: bool,
+	session: Option<u64>,
+	pending_transfer: Option<bool>,
 	t1_i: Pin<Box<tokio::time::Sleep>>,
 	t2: Pin<Box<tokio::time::Sleep>>,
 	t3: Pin<Box<tokio::time::Sleep>>,
@@ -188,6 +196,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 		config: ProtocolConfig,
 		rx: &'a mut mpsc::Receiver<ReceiveHandlerCommand>,
 		out_buffer_full: Arc<AtomicBool>,
+		session: Option<u64>,
 	) -> Self {
 		Self {
 			read_connection,
@@ -196,6 +205,10 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 			rx,
 			out_buffer_full,
 			t1_u: Box::pin(tokio::time::sleep(*TIMER_UNSET)),
+			t1_transfer: Box::pin(tokio::time::sleep(*TIMER_UNSET)),
+			active: true,
+			session,
+			pending_transfer: None,
 			t1_i: Box::pin(tokio::time::sleep(*TIMER_UNSET)),
 			t2: Box::pin(tokio::time::sleep(*TIMER_UNSET)),
 			t3: Box::pin(tokio::time::sleep(*TIMER_UNSET)),
@@ -251,6 +264,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 					while reading_buffer.len() > APDU_HEADER_SIZE && let Some(apdu) = Self::try_parse_apdu(&mut reading_buffer).whatever_context("Error parsing APDU")? {
 						match apdu.frame {
 							Frame::I(i) => {
+								if !self.active { whatever!("Received I-frame while data transfer is stopped"); }
 								self.handle_receive_i_frame(&i)?;
 								self.flush_pending_outgoing().await.whatever_context(
 									"Error sending queued ASDUs after I-frame ack",
@@ -273,10 +287,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 								)?;
 							}
 							Frame::U(u) => {
-								let should_stop = self.handle_receive_u_frame(&u).await?;
-								if should_stop {
-									return Ok(());
-								}
+								self.handle_receive_u_frame(&u).await?;
 							}
 						}
 						reset_t3 = true;
@@ -288,21 +299,32 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 				}
 				Some(cmd) = self.rx.recv() => {
 					match cmd {
-						ReceiveHandlerCommand::Asdu { asdu, reply } => {
+						ReceiveHandlerCommand::Asdu { asdu, session, reply } => {
+							if session != self.session { let _ = reply.send(Err(SendAsduQueueError::NotStarted)); continue; }
 							let ack = self.enqueue_incoming_asdu(asdu).await?;
 							let _ = reply.send(ack);
 						}
-						ReceiveHandlerCommand::Stop => {
-							send_frame(&mut *self.write_connection, &STOP_DT_ACT_FRAME).await.whatever_context("Error sending stopDT activation")?;
-							self.confirm_all_messages().await.whatever_context("Error confirming all messages")?;
-							self.t1_u.as_mut().reset(Instant::now() + self.config.t1);
+						ReceiveHandlerCommand::Start { session } => {
+							if self.session != Some(session) { continue; }
+							if !self.active && self.pending_transfer.is_none() {
+								send_frame(&mut *self.write_connection, &START_DT_ACT_FRAME).await?;
+								self.pending_transfer = Some(true);
+								self.t1_transfer.as_mut().reset(Instant::now() + self.config.t1);
+							}
+						}
+						ReceiveHandlerCommand::Stop { session } => {
+							if self.session != Some(session) { continue; }
+							if self.active && self.pending_transfer.is_none() {
+								if self.unacknowledged_rcv_frames != 0 { self.confirm_all_messages().await?; }
+								send_frame(&mut *self.write_connection, &STOP_DT_ACT_FRAME).await?;
+								self.pending_transfer = Some(false);
+								self.t1_transfer.as_mut().reset(Instant::now() + self.config.t1);
+							}
 						},
-						ReceiveHandlerCommand::Test => {
+						ReceiveHandlerCommand::Test { session } => {
+							if self.session != Some(session) { continue; }
 							self.send_test_frame().await.whatever_context("Error sending test frame")?;
 						},
-						_ => {
-							tracing::error!("Received unexpected command: {cmd:?}");
-						}
 					}
 				}
 				_ = &mut self.t3 => {
@@ -313,6 +335,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 					tracing::debug!("t2 timeout. Sending S frame");
 					self.confirm_all_messages().await.whatever_context("Error confirming all messages")?;
 				}
+				_ = &mut self.t1_transfer => { whatever!("t1 for data-transfer confirmation timeout"); }
 				_ = &mut self.t1_u => {
 					whatever!("t1 for u frames timeout");
 				}
@@ -328,6 +351,9 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 	/// [`ProtocolConfig::max_pending_outgoing_asdu`](crate::config::ProtocolConfig::max_pending_outgoing_asdu);
 	/// returns `Err(Error)` on wire/protocol failure.
 	async fn enqueue_incoming_asdu(&mut self, asdu: Asdu) -> Result<SendAsduCommandAck, Error> {
+		if !self.active || self.pending_transfer == Some(false) {
+			return Ok(Err(SendAsduQueueError::NotStarted));
+		}
 		self.flush_pending_outgoing().await.whatever_context("Error sending queued ASDUs")?;
 
 		if let Some(limit) = self.config.max_pending_outgoing_asdu_limit()
@@ -435,7 +461,9 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 	/// the deque still has items.
 	#[instrument(level = "debug", skip_all)]
 	async fn flush_pending_outgoing(&mut self) -> Result<(), Error> {
-		while self.unacknowledged_seq_num.len() < self.config.k as usize
+		while self.active
+			&& self.pending_transfer != Some(false)
+			&& self.unacknowledged_seq_num.len() < self.config.k as usize
 			&& let Some(asdu) = self.pending_outgoing_asdu.pop_front()
 		{
 			self.send_one_asdu(asdu).await?;
@@ -464,13 +492,17 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 		Ok(())
 	}
 
+	async fn set_data_transfer(&mut self, active: bool) -> Result<(), Error> {
+		self.active = active;
+		self.callback.on_data_transfer(active).await?;
+		if active {
+			self.flush_pending_outgoing().await?;
+		}
+		Ok(())
+	}
+
 	#[instrument(level = "debug", skip_all)]
-	async fn handle_receive_u_frame(&mut self, u: &UFrame) -> Result<bool, Error> {
-		tracing::debug!("Received U frame: {u:?}");
-		// Match exactly one flag — per IEC 60870-5-104 §5.3 a U-frame
-		// carries exactly one of these six commands. Treating any
-		// non-matched variant as TestFR-CON (the previous behavior)
-		// silently cleared the t1_u timer on stray frames.
+	async fn handle_receive_u_frame(&mut self, u: &UFrame) -> Result<(), Error> {
 		match (
 			u.test_fr_activation,
 			u.test_fr_confirmation,
@@ -480,40 +512,54 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 			u.stop_dt_confirmation,
 		) {
 			(true, false, false, false, false, false) => {
-				send_frame(&mut *self.write_connection, &TEST_FR_CON_FRAME)
-					.await
-					.whatever_context("Error sending testFR confirmation")?;
-				Ok(false)
+				send_frame(&mut *self.write_connection, &TEST_FR_CON_FRAME).await
 			}
 			(false, true, false, false, false, false) => {
-				// Valid TestFR-CON: clear the t1_u timer.
+				if self.outstanding_test_fr_con_messages == 0 {
+					whatever!("Unsolicited TESTFR confirmation");
+				}
 				self.outstanding_test_fr_con_messages = 0;
 				self.t1_u.as_mut().reset(Instant::now() + *TIMER_UNSET);
-				Ok(false)
+				Ok(())
 			}
 			(false, false, true, false, false, false) => {
-				// In-session StartDT-ACT is a protocol error per §5.3:
-				// data transfer is already started, so re-confirming would
-				// mask a peer fault. Close the connection instead.
-				whatever!("Received StartDT activation while data transfer is already started");
+				if self.active || self.pending_transfer.is_some() {
+					whatever!("Unexpected STARTDT activation");
+				}
+				send_frame(&mut *self.write_connection, &START_DT_CON_FRAME).await?;
+				self.set_data_transfer(true).await
 			}
 			(false, false, false, true, false, false) => {
-				// StartDT-CON arriving outside `send_start_dt` is unexpected
-				// for an established session.
-				whatever!("Received unsolicited StartDT confirmation");
+				if self.pending_transfer != Some(true) {
+					whatever!("Unsolicited STARTDT confirmation");
+				}
+				self.pending_transfer = None;
+				self.t1_transfer.as_mut().reset(Instant::now() + *TIMER_UNSET);
+				self.set_data_transfer(true).await
 			}
 			(false, false, false, false, true, false) => {
-				send_frame(&mut *self.write_connection, &STOP_DT_CON_FRAME)
-					.await
-					.whatever_context("Error sending stopDT confirmation")?;
-				Ok(true)
+				if self.unacknowledged_rcv_frames != 0 {
+					self.confirm_all_messages().await?;
+				}
+				send_frame(&mut *self.write_connection, &STOP_DT_CON_FRAME).await?;
+				if self.active {
+					self.set_data_transfer(false).await?;
+				}
+				Ok(())
 			}
 			(false, false, false, false, false, true) => {
-				tracing::debug!("StopDT confirmation");
-				Ok(true)
+				if self.pending_transfer != Some(false) {
+					whatever!("Unsolicited STOPDT confirmation");
+				}
+				self.pending_transfer = None;
+				self.t1_transfer.as_mut().reset(Instant::now() + *TIMER_UNSET);
+				if self.active {
+					self.set_data_transfer(false).await?;
+				}
+				Ok(())
 			}
 			_ => {
-				whatever!("Invalid U-frame: zero or multiple flags set: {u:?}");
+				whatever!("Invalid U-frame flags");
 			}
 		}
 	}
@@ -530,7 +576,9 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 			.whatever_context("Error sending test frame")?;
 		self.outstanding_test_fr_con_messages += 1;
 		self.t3.as_mut().reset(Instant::now() + self.config.t3);
-		self.t1_u.as_mut().reset(Instant::now() + self.config.t1);
+		if self.outstanding_test_fr_con_messages == 1 {
+			self.t1_u.as_mut().reset(Instant::now() + self.config.t1);
+		}
 		Ok(())
 	}
 

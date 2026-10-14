@@ -1,5 +1,13 @@
 # Changes in this fork
 
+## Unreleased — session continuity
+
+- Retain sequence, acknowledgement and pending-output state across STOPDT/STARTDT on one TCP connection, including coalesced input.
+- Continue link supervision while stopped; separate transfer-confirmation and TESTFR deadlines.
+- Add distinct disconnect callbacks. Server stopped callbacks now mean STOPDT, not TCP loss.
+- Send RTU initialization once per connection and reject stale client commands across reconnects.
+- Add independent wire regressions for both peers, queued output, initialization and deadline isolation.
+
 ## Unreleased — bounded delivery
 
 - Bound the RTU mailbox, server command queues and concurrent delivery tasks with configurable defaults and explicit overload errors.

@@ -53,6 +53,8 @@ pub trait ClientCallback {
 	async fn on_error(&self, error: Error) {
 		tracing::debug!("Error: {error}");
 	}
+	/// The peer session ended; reconnect creates fresh sequence state.
+	async fn on_connection_disconnected(&self) {}
 	async fn on_reconnecting(&self) {
 		tracing::debug!("Reconnecting");
 	}
@@ -60,11 +62,30 @@ pub trait ClientCallback {
 
 #[derive(Debug)]
 struct InnerClientCallback<C: ClientCallback + Send + Sync> {
+	session: std::sync::atomic::AtomicU64,
+	state: Arc<AtomicConnectionHandlerState>,
 	callback: C,
 }
 
 #[async_trait::async_trait]
 impl<C: ClientCallback + Send + Sync> ReceiveHandlerCallback for InnerClientCallback<C> {
+	async fn on_data_transfer(&self, active: bool) -> Result<(), Error> {
+		self.state.store(
+			if active {
+				ConnectionHandlerState::Started
+			} else {
+				ConnectionHandlerState::WaitingForStart
+			},
+			std::sync::atomic::Ordering::Relaxed,
+		);
+		if active {
+			self.callback.on_connection_started().await;
+		} else {
+			self.callback.on_connection_stopped().await;
+		}
+		Ok(())
+	}
+
 	async fn on_new_objects(&self, asdu: Asdu) -> Result<(), Error> {
 		self.callback.on_new_objects(asdu).await;
 		Ok(())
@@ -100,7 +121,13 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 	pub fn new(config: ClientConfig, callback: C) -> Self {
 		Self {
 			config,
-			callback: Arc::new(InnerClientCallback { callback }),
+			callback: Arc::new(InnerClientCallback {
+				session: std::sync::atomic::AtomicU64::new(0),
+				callback,
+				state: Arc::new(AtomicConnectionHandlerState::new(
+					ConnectionHandlerState::WaitingForStart,
+				)),
+			}),
 			receive_task: None,
 			write_tx: None,
 			out_buffer_full: Arc::new(AtomicBool::new(false)),
@@ -163,6 +190,7 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 
 	#[instrument(level = "debug")]
 	pub async fn send_asdu(&self, asdu: Asdu) -> Result<(), ClientError> {
+		let session = self.callback.session.load(std::sync::atomic::Ordering::SeqCst);
 		self.check_connection_started()?;
 
 		if self.out_buffer_full.load(std::sync::atomic::Ordering::Relaxed) {
@@ -171,11 +199,12 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 
 		if let Some(tx) = &self.write_tx {
 			let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-			tx.send(ReceiveHandlerCommand::Asdu { asdu, reply: reply_tx })
+			tx.send(ReceiveHandlerCommand::Asdu { asdu, session: Some(session), reply: reply_tx })
 				.await
 				.context(errors::SendCommand)?;
 			match reply_rx.await.context(errors::ReceiveHandlerAsduAck)? {
 				Ok(()) => Ok(()),
+				Err(SendAsduQueueError::NotStarted) => errors::NotReceiving.fail(),
 				Err(SendAsduQueueError::PendingBufferFull) => errors::OutputBufferFull.fail(),
 			}
 		} else {
@@ -185,6 +214,7 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 
 	#[instrument(level = "debug")]
 	pub async fn start_receiving(&mut self) -> Result<(), ClientError> {
+		let session = self.callback.session.load(std::sync::atomic::Ordering::SeqCst);
 		self.check_connected()?;
 
 		if let Some(state) = &self.connection_handler_state
@@ -195,7 +225,7 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 		}
 
 		if let Some(tx) = &self.write_tx {
-			tx.send(ReceiveHandlerCommand::Start).await.context(errors::SendCommand)?;
+			tx.send(ReceiveHandlerCommand::Start { session }).await.context(errors::SendCommand)?;
 		} else {
 			return errors::NoWriteChannel.fail();
 		}
@@ -204,10 +234,11 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 
 	#[instrument(level = "debug")]
 	pub async fn stop_receiving(&mut self) -> Result<(), ClientError> {
+		let session = self.callback.session.load(std::sync::atomic::Ordering::SeqCst);
 		self.check_connection_started()?;
 
 		if let Some(tx) = &self.write_tx {
-			tx.send(ReceiveHandlerCommand::Stop).await.context(errors::SendCommand)?;
+			tx.send(ReceiveHandlerCommand::Stop { session }).await.context(errors::SendCommand)?;
 		} else {
 			return errors::NoWriteChannel.fail();
 		}
@@ -216,10 +247,11 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 
 	#[instrument(level = "debug")]
 	pub async fn send_test_frame(&mut self) -> Result<(), ClientError> {
+		let session = self.callback.session.load(std::sync::atomic::Ordering::SeqCst);
 		self.check_connection_started()?;
 
 		if let Some(tx) = &self.write_tx {
-			tx.send(ReceiveHandlerCommand::Test).await.context(errors::SendCommand)?;
+			tx.send(ReceiveHandlerCommand::Test { session }).await.context(errors::SendCommand)?;
 		} else {
 			return errors::NoWriteChannel.fail();
 		}
@@ -441,5 +473,80 @@ impl<C: ClientCallback + Send + Sync + 'static> Drop for Client<C> {
 		if let Some(task) = &self.receive_task {
 			task.abort();
 		}
+	}
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod session_tests {
+	use std::time::Duration;
+
+	use tokio::{
+		io::{AsyncReadExt, AsyncWriteExt},
+		net::{TcpListener, TcpStream},
+		time::timeout,
+	};
+
+	use super::*;
+	struct Events(mpsc::UnboundedSender<()>);
+	#[async_trait]
+	impl ClientCallback for Events {
+		async fn on_new_objects(&self, _: Asdu) {}
+		async fn on_connection_started(&self) {
+			let _ = self.0.send(());
+		}
+	}
+	async fn handshake(listener: &TcpListener) -> TcpStream {
+		let (mut peer, _) = listener.accept().await.expect("accept");
+		let mut start = [0; 6];
+		peer.read_exact(&mut start).await.expect("start");
+		assert_eq!(start, [0x68, 4, 7, 0, 0, 0]);
+		peer.write_all(&[0x68, 4, 11, 0, 0, 0]).await.expect("confirm");
+		peer
+	}
+	#[tokio::test]
+	async fn reconnect_rejects_old_session_commands_and_resets_sequence() {
+		timeout(Duration::from_secs(3), async {
+			let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+			let (tx, mut rx) = mpsc::unbounded_channel();
+			let mut client = Client::new(
+				ClientConfig {
+					port: listener.local_addr().expect("address").port(),
+					..Default::default()
+				},
+				Events(tx),
+			);
+			client.connect().await.expect("connect");
+			client.start_receiving().await.expect("start");
+			let peer = handshake(&listener).await;
+			rx.recv().await.expect("started");
+			let old_session = client.callback.session.load(std::sync::atomic::Ordering::SeqCst);
+			drop(peer);
+			let mut peer = handshake(&listener).await;
+			rx.recv().await.expect("restarted");
+			let sample = Asdu::parse(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 1]).expect("sample");
+			let (reply, answer) = tokio::sync::oneshot::channel();
+			// A send admitted before disconnect may reach the queue after
+			// reconnect.
+			client
+				.write_tx
+				.as_ref()
+				.expect("sender")
+				.send(ReceiveHandlerCommand::Asdu {
+					asdu: sample.clone(),
+					session: Some(old_session),
+					reply,
+				})
+				.await
+				.expect("enqueue old work");
+			assert_eq!(answer.await.expect("answer"), Err(SendAsduQueueError::NotStarted));
+			client.send_asdu(sample).await.expect("new work");
+			let mut frame = [0; 16];
+			peer.read_exact(&mut frame).await.expect("new frame");
+			assert_eq!(&frame[..6], &[0x68, 14, 0, 0, 0, 0]);
+			client.shutdown().await.expect("shutdown");
+		})
+		.await
+		.expect("reconnect deadline");
 	}
 }

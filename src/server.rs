@@ -1,8 +1,12 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use crate::{
-	Connection, asdu::Asdu, config::ServerConfig, error::Error,
-	receive_handler::ReceiveHandlerCallback, server::connection_handler::ConnectionHandler,
+	Connection,
+	asdu::Asdu,
+	config::ServerConfig,
+	error::Error,
+	receive_handler::ReceiveHandlerCallback,
+	server::connection_handler::{AtomicConnectionState, ConnectionHandler, ConnectionState},
 };
 
 mod connection_handler;
@@ -73,12 +77,17 @@ pub trait ServerCallback {
 	async fn on_connection_stopped(&self, id: ConnectionId, address: SocketAddr) {
 		tracing::debug!("Connection {id:?} from {address} stopped");
 	}
+	/// TCP session ended, distinct from a STOPDT transition.
+	async fn on_connection_disconnected(&self, id: ConnectionId, address: SocketAddr) {
+		tracing::debug!("Connection {id:?} from {address} disconnected");
+	}
 	async fn on_error(&self, error: &Error) {
 		tracing::debug!("Error: {error}");
 	}
 }
 
 struct InnerServerCallback<C: ServerCallback + Send + Sync> {
+	state: Arc<AtomicConnectionState>,
 	id: ConnectionId,
 	address: SocketAddr,
 	callback: Arc<C>,
@@ -86,6 +95,19 @@ struct InnerServerCallback<C: ServerCallback + Send + Sync> {
 
 #[async_trait::async_trait]
 impl<C: ServerCallback + Send + Sync> ReceiveHandlerCallback for InnerServerCallback<C> {
+	async fn on_data_transfer(&self, active: bool) -> Result<(), Error> {
+		self.state.store(
+			if active { ConnectionState::Started } else { ConnectionState::WaitingStartDT },
+			std::sync::atomic::Ordering::Relaxed,
+		);
+		if active {
+			self.callback.on_connection_started_checked(self.id, self.address).await?;
+		} else {
+			self.callback.on_connection_stopped(self.id, self.address).await;
+		}
+		Ok(())
+	}
+
 	async fn on_new_objects(&self, asdu: Asdu) -> Result<(), Error> {
 		self.callback.on_new_objects_checked(asdu, self.id, self.address).await
 	}
@@ -392,7 +414,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 
 					let id = next_id;
 					next_id = next_id.next();
-					let callback = InnerServerCallback { id, address, callback: self.callback.clone() };
+					let callback = InnerServerCallback { id, address, callback: self.callback.clone(), state: Arc::new(AtomicConnectionState::new(ConnectionState::WaitingStartDT)) };
 					let connection_handler = ConnectionHandler::start(id, address, connection, self.config.clone(), callback, closed_tx.clone());
 					self.connections.insert(id, connection_handler);
 				}
@@ -402,7 +424,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 						match connection_handler {
 							Some(mut connection_handler) => {
 								connection_handler.join().await;
-								self.callback.on_connection_stopped(id, connection_handler.address).await;
+								self.callback.on_connection_disconnected(id, connection_handler.address).await;
 							}
 							None => {
 								tracing::error!("Connection {id:?} not found");
