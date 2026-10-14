@@ -252,7 +252,7 @@ pub(super) async fn run_actor(
 			ActorMsg::IngressAsdu { asdu, connection_id, peer, session } => {
 				if !session.is_active(){continue;}
 				if commands::is_process_command(&asdu){work.admit(&server,command_handler.clone(),&model,asdu,connection_id,peer,session).await;continue;}
-				let result=tokio::time::timeout(command_timeout,handle_ingress_asdu(
+				handle_ingress_asdu(
 					&mut model,
 					&interrogation_groups,
 					&counter_groups,
@@ -262,8 +262,7 @@ pub(super) async fn run_actor(
 					asdu,
 					connection_id,
 					peer,
-				)).await;
-				if result.is_err(){session.cancel();let _=server.disconnect(connection_id).await;}
+				).await;
 			}
 			ActorMsg::ConnectionStarted { connection_id, session, initialized } => {
 				if session.is_active() && !initialized.load(std::sync::atomic::Ordering::Relaxed) && send_end_of_initialization(&model,&server,connection_id).await {initialized.store(true,std::sync::atomic::Ordering::Relaxed);}
