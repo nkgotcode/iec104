@@ -84,9 +84,10 @@ use snafu::{ResultExt as _, whatever};
 pub use system_command_handler::{
 	CounterInterrogationContext, DefaultRtuClockSyncSystemHandler,
 	DefaultRtuCounterInterrogationHandler, DefaultRtuReadSystemHandler,
-	DefaultRtuResetProcessSystemHandler, DefaultRtuTestSystemHandler, RtuClockSyncSystemHandler,
-	RtuCounterInterrogationHandler, RtuReadSystemHandler, RtuResetProcessSystemHandler,
-	RtuSystemHandlers, RtuTestSystemHandler, SystemCommandContext,
+	DefaultRtuResetProcessSystemHandler, DefaultRtuTestSystemHandler, ReadOnlyCounterInterrogation,
+	RejectClockSync, RejectResetProcess, RtuClockSyncSystemHandler, RtuCounterInterrogationHandler,
+	RtuReadSystemHandler, RtuResetProcessSystemHandler, RtuSystemHandlers, RtuTestSystemHandler,
+	SystemCommandContext,
 };
 
 use crate::{config::ServerConfig, error::Error};

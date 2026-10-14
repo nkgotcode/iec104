@@ -2,6 +2,8 @@
 //! [`iec104::rtu_server::start_rtu_server_ephemeral`]).
 #![allow(clippy::expect_used)]
 
+mod policy;
+
 use std::sync::Arc;
 
 use iec104::{

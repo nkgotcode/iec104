@@ -48,6 +48,21 @@ without waiting. Retain a handle and await shutdown when completion matters.
 These limits do not yet bound the RTU actor mailbox or prevent a slow output peer
 from delaying a broadcast; that work remains tracked separately.
 
+## Explicit system-command policy
+
+`RtuSystemHandlers::monitoring_only()` allows test/read requests and ordinary
+counter reads, while rejecting clock sync, reset process and counter freeze/reset.
+Combine it with `RejectAllCommands` for process commands. Individual opt-in presets
+`RejectClockSync`, `RejectResetProcess` and `ReadOnlyCounterInterrogation` can also
+be composed with custom handlers. Defaults remain unchanged.
+
+A positive default clock-sync reply only stores the supplied timestamp; it does
+not set the operating-system clock. A positive default reset reply does not
+perform an external reset. Implementations must define and implement their own
+acceptance boundary before acknowledging those operations.
+
+See `cargo run --example monitoring_server` for explicit capability selection.
+
 ## Examples
 
 Build and run from the repository root:
