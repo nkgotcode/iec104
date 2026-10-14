@@ -77,6 +77,8 @@ async fn main() -> Result<(), Whatever> {
 
 	tracing::info!("Disconnecting");
 
+	client.shutdown().await.whatever_context("Shutdown failed")?;
+
 	Ok(())
 }
 
