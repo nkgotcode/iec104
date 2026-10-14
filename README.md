@@ -65,6 +65,25 @@ callbacks, then await `shutdown()` from an external task. A shutdown call from
 the task it would join requests cancellation and returns an error instead of
 self-joining. Callbacks must not retain handles in permanent ownership cycles.
 
+## Data-transfer sessions
+
+STOPDT pauses data transfer on the existing TCP connection. Sequence counters,
+acknowledgements, protocol-window output queues and coalesced input survive a
+subsequent STARTDT. No queued I-frame is transmitted while stopped. TESTFR and
+S-frame acknowledgements continue to be processed. STARTDT/STOPDT confirmation
+deadlines are independent from TESTFR deadlines. Unsolicited confirmations fail
+the session instead of clearing unrelated timers.
+
+`on_connection_stopped` now specifically reports STOPDT; TCP loss is reported
+through `on_connection_disconnected`. Update callbacks that previously treated
+server `on_connection_stopped` as a disconnect notification. Explicit shutdown
+still cancels callbacks; it does not promise a final notification. An RTU emits
+end-of-initialization only on the first STARTDT of each TCP connection.
+
+Client reconnection creates fresh sequence state and rejects queued commands
+from the previous connection. There is no implicit command replay across a
+connection loss. A successful local send is not proof of remote execution.
+
 ## Explicit system-command policy
 
 `RtuSystemHandlers::monitoring_only()` allows test/read requests and ordinary

@@ -279,7 +279,7 @@ impl ServerCallback for ShutdownFromCallback {
 			self.stop().await;
 		}
 	}
-	async fn on_connection_stopped(&self, _: ConnectionId, _: SocketAddr) {
+	async fn on_connection_disconnected(&self, _: ConnectionId, _: SocketAddr) {
 		if self.when == 1 {
 			self.stop().await;
 		}

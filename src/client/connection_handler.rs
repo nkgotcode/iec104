@@ -49,12 +49,14 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 		let connection =
 			Self::make_connection(&config).await.whatever_context("Error making connection")?;
 		let (read_connection, write_connection) = tokio::io::split(connection);
+		callback
+			.state
+			.store(ConnectionHandlerState::WaitingForStart, std::sync::atomic::Ordering::Relaxed);
+		out_buffer_full.store(false, std::sync::atomic::Ordering::Relaxed);
 		Ok(Self {
-			callback,
+			callback: callback.clone(),
 			config,
-			state: Arc::new(AtomicConnectionHandlerState::new(
-				ConnectionHandlerState::WaitingForStart,
-			)),
+			state: callback.state.clone(),
 			read_connection,
 			write_connection,
 			rx,
@@ -73,7 +75,13 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 				ConnectionHandlerState::WaitingForStart => {
 					if let Some(cmd) = self.rx.recv().await {
 						match cmd {
-							ReceiveHandlerCommand::Start => {
+							ReceiveHandlerCommand::Start { session }
+								if session
+									== self
+										.callback
+										.session
+										.load(std::sync::atomic::Ordering::SeqCst) =>
+							{
 								self.state.store(
 									ConnectionHandlerState::Starting,
 									std::sync::atomic::Ordering::Relaxed,
@@ -113,6 +121,7 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 						self.config.protocol.clone(),
 						&mut self.rx,
 						self.out_buffer_full.clone(),
+						Some(self.callback.session.load(std::sync::atomic::Ordering::SeqCst)),
 					)
 					.receive_task()
 					.await
@@ -122,6 +131,7 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 							ConnectionHandlerState::Reconnecting,
 							std::sync::atomic::Ordering::Relaxed,
 						);
+						self.callback.callback.on_connection_disconnected().await;
 						self.callback.on_error(e).await;
 						continue;
 					}
@@ -141,6 +151,8 @@ impl<C: ClientCallback + Send + Sync + 'static> ConnectionHandler<C> {
 						continue;
 					};
 					(self.read_connection, self.write_connection) = tokio::io::split(connection);
+					self.callback.session.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					self.out_buffer_full.store(false, std::sync::atomic::Ordering::Relaxed);
 					self.state.store(
 						ConnectionHandlerState::Starting,
 						std::sync::atomic::Ordering::Relaxed,

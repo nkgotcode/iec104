@@ -89,12 +89,13 @@ pub(crate) enum RegisterPointError {
 
 #[derive(Clone)]
 pub(super) struct NetworkIngress {
+	initialized: Arc<std::sync::Mutex<HashSet<ConnectionId>>>,
 	tx: tokio::sync::mpsc::Sender<ActorMsg>,
 }
 
 impl NetworkIngress {
-	pub(super) const fn new(tx: tokio::sync::mpsc::Sender<ActorMsg>) -> Self {
-		Self { tx }
+	pub(super) fn new(tx: tokio::sync::mpsc::Sender<ActorMsg>) -> Self {
+		Self { tx, initialized: Arc::new(std::sync::Mutex::new(HashSet::new())) }
 	}
 }
 
@@ -117,12 +118,24 @@ impl ServerCallback for NetworkIngress {
 	async fn on_connection_started_checked(
 		&self,
 		connection_id: ConnectionId,
-		_address: SocketAddr,
+		_: SocketAddr,
 	) -> Result<(), crate::error::Error> {
 		use snafu::ResultExt as _;
-		self.tx
-			.try_send(ActorMsg::ConnectionStarted { connection_id })
-			.whatever_context("RTU ingress unavailable or overloaded")
+		let mut initialized =
+			self.initialized.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		if !initialized.contains(&connection_id) {
+			self.tx
+				.try_send(ActorMsg::ConnectionStarted { connection_id })
+				.whatever_context("RTU ingress unavailable or overloaded")?;
+			initialized.insert(connection_id);
+		}
+		Ok(())
+	}
+	async fn on_connection_disconnected(&self, connection_id: ConnectionId, _: SocketAddr) {
+		self.initialized
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.remove(&connection_id);
 	}
 }
 

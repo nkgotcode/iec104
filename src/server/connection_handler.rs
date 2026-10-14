@@ -78,7 +78,7 @@ impl ConnectionHandler {
 	) -> Self {
 		let (read_connection, write_connection) = tokio::io::split(connection);
 		let (cmd_tx, rx) = mpsc::channel(config.command_capacity);
-		let state = Arc::new(AtomicConnectionState::new(ConnectionState::WaitingStartDT));
+		let state = callback.state.clone();
 		let inner_connection_handler = InnerConnectionHandler {
 			read_connection,
 			write_connection,
@@ -119,7 +119,8 @@ impl ConnectionHandler {
 			return error::NotStarted.fail();
 		}
 		let (reply_tx, reply_rx) = oneshot::channel();
-		match self.tx.try_send(ReceiveHandlerCommand::Asdu { asdu, reply: reply_tx }) {
+		match self.tx.try_send(ReceiveHandlerCommand::Asdu { asdu, session: None, reply: reply_tx })
+		{
 			Ok(()) => Ok(reply_rx),
 			Err(mpsc::error::TrySendError::Full(_)) => error::Overloaded.fail(),
 			Err(mpsc::error::TrySendError::Closed(cmd)) => {
@@ -136,6 +137,7 @@ impl ConnectionHandler {
 		match tokio::time::timeout_at(deadline, rx).await {
 			Ok(result) => match result.context(error::ReceiveHandlerAsduAck)? {
 				Ok(()) => Ok(()),
+				Err(SendAsduQueueError::NotStarted) => error::NotStarted.fail(),
 				Err(SendAsduQueueError::PendingBufferFull) => {
 					error::PendingOutgoingAsduBufferFull.fail()
 				}
@@ -206,6 +208,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerConnectionHandler<C> {
 						self.config.protocol.clone(),
 						&mut self.rx,
 						out_buffer_full.clone(),
+						None,
 					);
 					if let Err(e) = rcv_handler.receive_task().await {
 						self.callback.on_error(&e).await;
