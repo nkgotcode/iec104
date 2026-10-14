@@ -89,11 +89,11 @@ pub(crate) enum RegisterPointError {
 
 #[derive(Clone)]
 pub(super) struct NetworkIngress {
-	tx: tokio::sync::mpsc::UnboundedSender<ActorMsg>,
+	tx: tokio::sync::mpsc::Sender<ActorMsg>,
 }
 
 impl NetworkIngress {
-	pub(super) const fn new(tx: tokio::sync::mpsc::UnboundedSender<ActorMsg>) -> Self {
+	pub(super) const fn new(tx: tokio::sync::mpsc::Sender<ActorMsg>) -> Self {
 		Self { tx }
 	}
 }
@@ -101,16 +101,33 @@ impl NetworkIngress {
 #[async_trait::async_trait]
 impl ServerCallback for NetworkIngress {
 	async fn on_new_objects(&self, asdu: Asdu, connection_id: ConnectionId, peer: SocketAddr) {
-		let _ = self.tx.send(ActorMsg::IngressAsdu { asdu, connection_id, peer });
+		let _ = self.on_new_objects_checked(asdu, connection_id, peer).await;
 	}
-
-	async fn on_connection_started(&self, connection_id: ConnectionId, _address: SocketAddr) {
-		let _ = self.tx.send(ActorMsg::ConnectionStarted { connection_id });
+	async fn on_new_objects_checked(
+		&self,
+		asdu: Asdu,
+		connection_id: ConnectionId,
+		peer: SocketAddr,
+	) -> Result<(), crate::error::Error> {
+		use snafu::ResultExt as _;
+		self.tx
+			.try_send(ActorMsg::IngressAsdu { asdu, connection_id, peer })
+			.whatever_context("RTU ingress unavailable or overloaded")
+	}
+	async fn on_connection_started_checked(
+		&self,
+		connection_id: ConnectionId,
+		_address: SocketAddr,
+	) -> Result<(), crate::error::Error> {
+		use snafu::ResultExt as _;
+		self.tx
+			.try_send(ActorMsg::ConnectionStarted { connection_id })
+			.whatever_context("RTU ingress unavailable or overloaded")
 	}
 }
 
 pub(super) async fn run_actor(
-	mut rx: tokio::sync::mpsc::UnboundedReceiver<ActorMsg>,
+	mut rx: tokio::sync::mpsc::Receiver<ActorMsg>,
 	server: Server,
 	mut model: HashMap<PointAddress, PointValue>,
 	mut interrogation_groups: HashMap<PointAddress, u8>,

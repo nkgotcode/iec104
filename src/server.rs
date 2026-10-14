@@ -39,6 +39,26 @@ impl ConnectionId {
 )]
 pub trait ServerCallback {
 	async fn on_new_objects(&self, asdu: Asdu, id: ConnectionId, address: SocketAddr);
+	/// Fallible ingress admission. Returning an error closes this peer. The
+	/// default preserves the existing callback; adapters can reject overload.
+	async fn on_new_objects_checked(
+		&self,
+		asdu: Asdu,
+		id: ConnectionId,
+		address: SocketAddr,
+	) -> Result<(), Error> {
+		self.on_new_objects(asdu, id, address).await;
+		Ok(())
+	}
+	/// Fallible STARTDT notification; returning an error closes this peer.
+	async fn on_connection_started_checked(
+		&self,
+		id: ConnectionId,
+		address: SocketAddr,
+	) -> Result<(), Error> {
+		self.on_connection_started(id, address).await;
+		Ok(())
+	}
 	async fn on_new_connection(&self, address: SocketAddr) {
 		tracing::debug!("New connection from {address}");
 	}
@@ -61,14 +81,18 @@ struct InnerServerCallback<C: ServerCallback + Send + Sync> {
 
 #[async_trait::async_trait]
 impl<C: ServerCallback + Send + Sync> ReceiveHandlerCallback for InnerServerCallback<C> {
-	async fn on_new_objects(&self, asdu: Asdu) {
-		self.callback.on_new_objects(asdu, self.id, self.address).await;
+	async fn on_new_objects(&self, asdu: Asdu) -> Result<(), Error> {
+		self.callback.on_new_objects_checked(asdu, self.id, self.address).await
 	}
 }
 
 impl<C: ServerCallback + Send + Sync> InnerServerCallback<C> {
-	async fn on_connection_started(&self, id: ConnectionId, address: SocketAddr) {
-		self.callback.on_connection_started(id, address).await;
+	async fn on_connection_started(
+		&self,
+		id: ConnectionId,
+		address: SocketAddr,
+	) -> Result<(), Error> {
+		self.callback.on_connection_started_checked(id, address).await
 	}
 	async fn on_error(&self, error: &Error) {
 		self.callback.on_error(error).await;
@@ -97,6 +121,7 @@ pub struct Server {
 
 #[derive(Debug)]
 struct ServerLifecycle {
+	id: tokio::task::Id,
 	stop: watch::Sender<()>,
 	task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -116,6 +141,7 @@ struct InnerServer<C: ServerCallback + Send + Sync + 'static> {
 	acceptor: Option<crate::tls::TlsAcceptor>,
 	listener: TcpListener,
 	pending: JoinSet<(SocketAddr, Result<Connection, Error>)>,
+	deliveries: JoinSet<()>,
 }
 
 impl Server {
@@ -133,7 +159,10 @@ impl Server {
 		config: ServerConfig,
 		callback: C,
 	) -> Result<(Self, SocketAddr), Error> {
-		let (tx, rx) = mpsc::channel(1024);
+		if config.command_capacity == 0 || config.rtu_queue_capacity == 0 {
+			whatever!("Queue capacities must be nonzero");
+		}
+		let (tx, rx) = mpsc::channel(config.command_capacity);
 		let inner_server = InnerServer::connect(config, Arc::new(callback), rx).await?;
 		let listen_addr = inner_server
 			.listen_local_addr()
@@ -149,6 +178,7 @@ impl Server {
 				}
 			}
 			inner_server.pending.shutdown().await;
+			inner_server.deliveries.shutdown().await;
 			for connection in inner_server.connections.values() {
 				connection.abort();
 			}
@@ -156,7 +186,8 @@ impl Server {
 				connection.join().await;
 			}
 		});
-		let lifecycle = Arc::new(ServerLifecycle { stop, task: Mutex::new(Some(task)) });
+		let lifecycle =
+			Arc::new(ServerLifecycle { id: task.id(), stop, task: Mutex::new(Some(task)) });
 		Ok((Self { tx, lifecycle }, listen_addr))
 	}
 
@@ -165,9 +196,13 @@ impl Server {
 	/// Queued output is discarded, not flushed. No callback runs after success.
 	/// Cancelling this future still requests shutdown; a later call can join
 	/// it. Dropping the last handle requests the same cleanup without
-	/// waiting.
+	/// waiting. Calling from a callback on the server task requests shutdown
+	/// and returns an error; use [`Self::request_shutdown`] inside callbacks.
 	pub async fn shutdown(&self) -> Result<(), Error> {
-		self.lifecycle.stop.send_replace(());
+		self.request_shutdown();
+		if tokio::task::try_id() == Some(self.lifecycle.id) {
+			whatever!("Shutdown requested from a server callback; join from an external task");
+		}
 		let mut task = self.lifecycle.task.lock().await;
 		if let Some(handle) = task.as_mut() {
 			let result = handle.await;
@@ -175,6 +210,12 @@ impl Server {
 			result.whatever_context("Server task failed during shutdown")?;
 		}
 		Ok(())
+	}
+
+	/// Request cancellation without joining. Safe to call inside a callback.
+	/// An external task should call [`Self::shutdown`] to await cleanup.
+	pub fn request_shutdown(&self) {
+		self.lifecycle.stop.send_replace(());
 	}
 
 	pub async fn send_asdu(&self, id: ConnectionId, asdu: Asdu) -> Result<(), error::ServerError> {
@@ -201,7 +242,10 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 		// Reject spec-violating k/w combinations (IEC 60870-5-104 §5.2)
 		// before binding the socket so misconfiguration fails fast.
 		config.protocol.validate().whatever_context("Invalid protocol configuration")?;
-		if config.max_connections == 0 || config.tls_handshake_timeout.is_zero() {
+		if config.max_connections == 0
+			|| config.tls_handshake_timeout.is_zero()
+			|| config.delivery_timeout.is_zero()
+		{
 			whatever!("Server connection limit and TLS handshake timeout must be nonzero");
 		}
 
@@ -229,11 +273,61 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 			acceptor,
 			listener,
 			pending: JoinSet::new(),
+			deliveries: JoinSet::new(),
 		})
 	}
 
 	fn listen_local_addr(&self) -> std::io::Result<SocketAddr> {
 		self.listener.local_addr()
+	}
+
+	fn dispatch(&mut self, command: ServerCommand) {
+		if self.deliveries.len() >= self.config.command_capacity {
+			let tx = match command {
+				ServerCommand::SingleConnection { tx, .. }
+				| ServerCommand::Broadcast { tx, .. } => tx,
+			};
+			let _ = tx.send(error::Overloaded.fail());
+			return;
+		}
+		let deadline = tokio::time::Instant::now() + self.config.delivery_timeout;
+		let mut replies = Vec::new();
+		let mut result = Ok(());
+		let tx = match command {
+			ServerCommand::SingleConnection { id, asdu, tx } => {
+				match self.connections.get(&id) {
+					Some(peer) => match peer.enqueue_asdu(asdu) {
+						Ok(rx) => replies.push((rx, peer.task.abort_handle())),
+						Err(error) => result = Err(error),
+					},
+					None => result = error::ConnectionNotFound { id }.fail(),
+				}
+				tx
+			}
+			ServerCommand::Broadcast { asdu, tx } => {
+				for peer in self.connections.values().filter(|peer| peer.is_started()) {
+					match peer.enqueue_asdu(asdu.clone()) {
+						Ok(rx) => replies.push((rx, peer.task.abort_handle())),
+						Err(error) => {
+							if result.is_ok() {
+								result = Err(error);
+							}
+						}
+					}
+				}
+				tx
+			}
+		};
+		self.deliveries.spawn(async move {
+			for (rx, abort) in replies {
+				if let Err(error) = ConnectionHandler::wait_reply(rx, abort, deadline).await
+					&& result.is_ok()
+				{
+					result = Err(error);
+				}
+			}
+			let _ = tx.send(result);
+		});
 	}
 
 	async fn start(&mut self) -> Result<(), Error> {
@@ -309,35 +403,13 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerServer<C> {
 						}
 					}
 				}
+				_ = self.deliveries.join_next(), if !self.deliveries.is_empty() => {},
 				command = self.rx.recv() => {
 					let Some(command) = command else {
 						tracing::error!("Error receiving command. Aborting...");
 						whatever!("");
 					};
-					match command {
-						ServerCommand::SingleConnection { id, asdu, tx } => {
-							let connection_handler = self.connections.get(&id);
-							let res = match connection_handler {
-								Some(connection_handler) => {
-									connection_handler.send_asdu(asdu).await
-								}
-								None => {
-									error::ConnectionNotFound { id }.fail()
-								}
-							};
-							let _ = tx.send(res).inspect_err(|e| tracing::error!("Error sending response to single connection command: {e:?}"));
-						},
-						ServerCommand::Broadcast { asdu, tx } => {
-							let mut res = Ok(());
-							for connection_handler in self.connections.values().filter(|c| c.is_started()) {
-								if let Err(e) = connection_handler.send_asdu(asdu.clone()).await {
-									res = Err(e);
-									break;
-								}
-							}
-							let _ = tx.send(res).inspect_err(|e| tracing::error!("Error sending response to broadcast command: {e:?}"));
-						},
-					}
+					self.dispatch(command);
 				}
 			}
 		}

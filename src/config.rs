@@ -146,6 +146,18 @@ pub struct ServerConfig {
 	/// nonzero.
 	#[serde(with = "humantime_serde", default = "default_duration::<10>")]
 	pub tls_handshake_timeout: Duration,
+	/// Capacity of the server/per-connection command queues and maximum pending
+	/// delivery operations. Must be nonzero. Default 256.
+	#[serde(default = "default_command_capacity")]
+	pub command_capacity: usize,
+	/// Maximum wait for a peer to process queued output. A timed-out peer is
+	/// disconnected; other peers are still attempted. Default 1 second.
+	#[serde(with = "humantime_serde", default = "default_duration::<1>")]
+	pub delivery_timeout: Duration,
+	/// RTU model mailbox capacity. Overloaded network peers are disconnected;
+	/// local operations return Overloaded. Must be nonzero. Default 1024.
+	#[serde(default = "default_rtu_capacity")]
+	pub rtu_queue_capacity: usize,
 }
 
 /// The server TLS configuration
@@ -192,6 +204,9 @@ impl Default for ServerConfig {
 			protocol: ProtocolConfig::default(),
 			tls: None,
 			max_connections: default_max_connections(),
+			command_capacity: default_command_capacity(),
+			delivery_timeout: Duration::from_secs(1),
+			rtu_queue_capacity: default_rtu_capacity(),
 			tls_handshake_timeout: Duration::from_secs(10),
 		}
 	}
@@ -211,6 +226,13 @@ const fn default_duration<const N: u64>() -> Duration {
 
 const fn default_max_connections() -> usize {
 	64
+}
+
+const fn default_command_capacity() -> usize {
+	256
+}
+const fn default_rtu_capacity() -> usize {
+	1024
 }
 
 #[cfg(test)]
