@@ -64,5 +64,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: apt-get update && apt-get install -y --no-install-recommends python3 python3-venv
       - run: python3 -m venv /tmp/c104-peer
-      - run: /tmp/c104-peer/bin/pip install --only-binary=:all: --require-hashes -r tests/requirements-interop.txt
+      - run: |
+          /tmp/c104-peer/bin/pip install --only-binary=:all: --require-hashes -r tests/requirements-interop.txt
       - run: sh tests/run_rtu_e2e.sh
