@@ -107,10 +107,64 @@ define_rtu_point_value! {
 }
 
 impl PointValue {
+	// Snapshot identity is representation equality, not IEEE numeric equality:
+	// unchanged NaNs are stable, while a changed payload or signed zero is
+	// stale.
+	pub(super) fn same_snapshot(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Self::MMeNc1(a), Self::MMeNc1(b)) => {
+				a.value.to_bits() == b.value.to_bits() && a.qds == b.qds
+			}
+			(Self::MMeTc1(a), Self::MMeTc1(b)) => {
+				a.value.to_bits() == b.value.to_bits() && a.qds == b.qds && a.time == b.time
+			}
+			(Self::MMeTf1(a), Self::MMeTf1(b)) => {
+				a.value.to_bits() == b.value.to_bits() && a.qds == b.qds && a.time == b.time
+			}
+			_ => self == other,
+		}
+	}
+
 	/// Integrated totals (`M_IT_NA_1` / `M_IT_TB_1`) used with `C_CI_NA_1`
 	/// counter interrogation.
 	#[must_use]
 	pub const fn is_counter_integration(&self) -> bool {
 		matches!(self, Self::MItNa1(_) | Self::MItTb1(_))
+	}
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+	use super::*;
+
+	#[test]
+	fn float_snapshots_compare_bits_quality_and_time() {
+		macro_rules! check {
+			($variant:ident, $payload:ident) => {{
+				let initial = $payload { value: f32::from_bits(0x7fc0_0001), ..Default::default() };
+				let point = PointValue::$variant(initial.clone());
+				assert!(point.same_snapshot(&point.clone()));
+				let mut changed = initial.clone();
+				changed.value = f32::from_bits(0x7fc0_0002);
+				assert!(!point.same_snapshot(&PointValue::$variant(changed)));
+				let mut changed = initial.clone();
+				changed.qds.iv = true;
+				assert!(!point.same_snapshot(&PointValue::$variant(changed)));
+				let positive = PointValue::$variant($payload { value: 0.0, ..Default::default() });
+				let negative = PointValue::$variant($payload { value: -0.0, ..Default::default() });
+				assert!(!positive.same_snapshot(&negative));
+			}};
+		}
+		check!(MMeNc1, MMeNc1);
+		check!(MMeTc1, MMeTc1);
+		check!(MMeTf1, MMeTf1);
+		let a = MMeTc1 { value: f32::NAN, ..Default::default() };
+		let mut b = a.clone();
+		b.time.ms = 1;
+		assert!(!PointValue::MMeTc1(a).same_snapshot(&PointValue::MMeTc1(b)));
+		let a = MMeTf1 { value: f32::NAN, ..Default::default() };
+		let mut b = a.clone();
+		b.time.ms = 1;
+		assert!(!PointValue::MMeTf1(a).same_snapshot(&PointValue::MMeTf1(b)));
 	}
 }

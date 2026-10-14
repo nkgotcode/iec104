@@ -1,5 +1,10 @@
 # Changes in this fork
 
+## Unreleased — floating-point command snapshots
+
+- Compare floating-point monitoring snapshots by representation, preserving unchanged NaN payloads while rejecting changed bits, quality or timestamps. Public numeric equality remains unchanged.
+- Add real-TCP immediate-command recovery and concurrent-update rejection tests for all three floating-point monitoring types.
+
 ## Unreleased — framing and sequence serialization
 
 - Reject mismatched APDU lengths, reserved S-frame bits, ambiguous U-frame functions and out-of-range sequence counters.
