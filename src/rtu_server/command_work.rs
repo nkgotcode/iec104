@@ -142,7 +142,10 @@ impl CommandWork {
 					&& handling.apply_updates.iter().any(|(address, value)| {
 						!model.get(address).is_some_and(|current| {
 							current.type_id() == value.type_id()
-								&& request.snapshot.get(address) == Some(current)
+								&& request
+									.snapshot
+									.get(address)
+									.is_some_and(|snapshot| snapshot.same_snapshot(current))
 						})
 					}) {
 					handling = CommandHandling::echo(&request.asdu, true);

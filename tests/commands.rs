@@ -365,3 +365,81 @@ async fn failed_panicking_or_invalid_completion_never_emits_success_termination(
 		rtu.shutdown().await.expect("shutdown");
 	}
 }
+
+struct SnapshotUpdate {
+	replacement: PointValue,
+	started: Arc<Semaphore>,
+	release: Arc<Semaphore>,
+}
+#[async_trait]
+impl RtuCommandHandler for SnapshotUpdate {
+	async fn handle_command(&self, ctx: CommandContext<'_>) -> CommandHandling {
+		self.started.add_permits(1);
+		let _permit = self.release.acquire().await.expect("release preparation");
+		let mut handling = CommandHandling::echo(ctx.asdu, false);
+		handling.apply_updates.push((PointAddress::new(1, 1), self.replacement.clone()));
+		handling
+	}
+}
+
+fn float_points(value: f32) -> [PointValue; 3] {
+	use iec104::types::{MMeTc1, MMeTf1};
+	[
+		PointValue::MMeNc1(MMeNc1 { value, ..Default::default() }),
+		PointValue::MMeTc1(MMeTc1 { value, ..Default::default() }),
+		PointValue::MMeTf1(MMeTf1 { value, ..Default::default() }),
+	]
+}
+
+#[tokio::test]
+async fn immediate_commands_recover_unchanged_nan_snapshots_and_reject_changed_payloads() {
+	for changed in [false, true] {
+		for ((initial, replacement), concurrent) in float_points(f32::from_bits(0x7fc0_0001))
+			.into_iter()
+			.zip(float_points(12.5))
+			.zip(float_points(f32::from_bits(0x7fc0_0002)))
+		{
+			let handler = Arc::new(SnapshotUpdate {
+				replacement,
+				started: Arc::new(Semaphore::new(0)),
+				release: Arc::new(Semaphore::new(0)),
+			});
+			let (rtu, addr) = start_rtu_server_ephemeral(
+				ServerConfig::default(),
+				vec![RtuInitialPoint::new(PointAddress::new(1, 1), initial)],
+				handler.clone(),
+				RtuSystemHandlers::monitoring_only(),
+			)
+			.await
+			.expect("rtu");
+			let mut peer = Peer::connect(addr).await;
+			peer.send(45, 6, 1, 1).await;
+			let _started = timeout(WAIT, handler.started.acquire())
+				.await
+				.expect("preparation deadline")
+				.expect("started");
+			if changed {
+				rtu.set_point(PointAddress::new(1, 1), concurrent)
+					.await
+					.expect("concurrent update");
+				let monitoring = peer.asdu().await;
+				assert_eq!(
+					u32::from_le_bytes(monitoring[9..13].try_into().expect("float bytes")),
+					0x7fc0_0002
+				);
+			}
+			handler.release.add_permits(1);
+			if !changed {
+				let monitoring = peer.asdu().await;
+				assert_ne!(monitoring[0], 45, "unchanged NaN must permit the update");
+				assert_eq!(
+					u32::from_le_bytes(monitoring[9..13].try_into().expect("float bytes")),
+					12.5_f32.to_bits()
+				);
+			}
+			let reply = peer.asdu().await;
+			assert_eq!((reply[0], reply[2]), (45, if changed { 71 } else { 7 }));
+			rtu.shutdown().await.expect("shutdown");
+		}
+	}
+}
