@@ -1,11 +1,18 @@
-# iec104
+# iec104 — independently maintained fork
+
+[![Rust checks](https://github.com/nkgotcode/iec104/actions/workflows/rust.yaml/badge.svg?branch=main)](https://github.com/nkgotcode/iec104/actions/workflows/rust.yaml)
+
+Development repository: **[nkgotcode/iec104](https://github.com/nkgotcode/iec104)**. Based on [mzaniolo/iec104](https://github.com/mzaniolo/iec104); the original MIT copyright and license are preserved. This fork owns its fixes, CI and development revisions independently of upstream review.
+
+**Development status:** experimental. See [changes](CHANGELOG.md), [contribution and release checks](CONTRIBUTING.md), [security reporting](SECURITY.md), and [our issue tracker](https://github.com/nkgotcode/iec104/issues). The crate name remains `iec104` for compatibility, but this fork is Git-only (`publish = false`). Consume a tested full commit SHA, not a moving branch.
+
+The docs.rs links below describe the upstream API, not separately published fork documentation. Generate the exact fork docs with `cargo doc --locked --no-deps`.
+
 
 Rust library for **[IEC 60870-5-104](https://en.wikipedia.org/wiki/IEC_60870-5#IEC_60870-5-104)** (IEC 104 over TCP): APDUs, ASDUs, type IDs, and async I/O on **Tokio**. The focus is **balanced** (station-to-station) communication as used in energy and automation SCADA.
 
 **Status:** usable for client work, low-level servers, and the bundled RTU-style server layer, but the API and behavior are still evolving. Report issues and try the examples before relying on it in production.
 
-[![crates.io](https://img.shields.io/crates/v/iec104.svg)](https://crates.io/crates/iec104)
-[![docs.rs](https://docs.rs/iec104/badge.svg)](https://docs.rs/iec104)
 
 ## What this crate provides
 
@@ -38,8 +45,8 @@ cargo run --example rtu_server
 
 End-to-end checks against `examples/rtu_server` live under [`tests/`](tests/):
 
-- [`tests/run_rtu_e2e.sh`](tests/run_rtu_e2e.sh) — builds the example, starts it, runs [`tests/test_client.py`](tests/test_client.py).
-- The script expects the **[iec104-python](https://pypi.org/project/c104/)** module (`c104`) in the environment (for example the project `.venv`; see comments in the shell script).
+- Start `cargo run --example rtu_server`, then run [`tests/test_client.py`](tests/test_client.py) in another terminal.
+- The Python harness expects the **[iec104-python](https://pypi.org/project/c104/)** module (`c104`) in the environment (for example in a project `.venv`).
 
 The RTU example is aligned with that client for general interrogation, clock sync, counter interrogation, group interrogation, **C_TS_TA_1** test command, and process commands. Note: interoperability always depends on both stacks’ choices (type IDs, COTs, timeouts).
 
@@ -54,12 +61,14 @@ The RTU example is aligned with that client for general interrogation, clock syn
 
 By default the crate has **no TLS dependencies** and accepts plain TCP only. If `tls` is set in config without enabling a TLS feature, connection setup returns an error.
 
+For a deployed application, add `rev` with the tested full commit SHA. The examples below show the source and feature selection only.
+
 **Breaking change (0.5+):** TLS is no longer enabled implicitly. Downstream crates that use TLS must opt in:
 
 ```toml
-iec104 = { version = "0.5", features = ["native_tls"] }
+iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["native_tls"] }
 # or
-iec104 = { version = "0.5", features = ["rustls"] }
+iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["rustls"] }
 ```
 
 ## Requirements

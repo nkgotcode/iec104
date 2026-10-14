@@ -37,6 +37,10 @@ use connection_handler::AtomicConnectionHandlerState;
 use crate::receive_handler::{ReceiveHandlerCommand, SendAsduQueueError};
 
 #[async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait ClientCallback {
 	async fn on_new_objects(&self, asdu: Asdu);
 

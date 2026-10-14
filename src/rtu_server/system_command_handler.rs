@@ -81,6 +81,10 @@ pub struct CounterInterrogationContext<'a> {
 /// `C_TS_NA_1` and `C_TS_TA_1` when [`Cot`] is [`Cot::Activation`] or
 /// [`Cot::Request`].
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait RtuTestSystemHandler: Send + Sync {
 	async fn handle_test(
 		&self,
@@ -91,6 +95,10 @@ pub trait RtuTestSystemHandler: Send + Sync {
 
 /// `C_RD_NA_1` when [`Cot`] is [`Cot::Activation`] or [`Cot::Request`].
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait RtuReadSystemHandler: Send + Sync {
 	async fn handle_read(
 		&self,
@@ -101,6 +109,10 @@ pub trait RtuReadSystemHandler: Send + Sync {
 
 /// `C_CS_NA_1` when [`Cot`] is [`Cot::Activation`] or [`Cot::Request`].
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait RtuClockSyncSystemHandler: Send + Sync {
 	async fn handle_clock_sync(
 		&self,
@@ -111,6 +123,10 @@ pub trait RtuClockSyncSystemHandler: Send + Sync {
 
 /// `C_CI_NA_1` when [`Cot`] is [`Cot::Activation`] or [`Cot::Request`].
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait RtuCounterInterrogationHandler: Send + Sync {
 	async fn handle_counter_interrogation(
 		&self,
@@ -121,6 +137,10 @@ pub trait RtuCounterInterrogationHandler: Send + Sync {
 
 /// `C_RP_NA_1` when [`Cot`] is [`Cot::Activation`] or [`Cot::Request`].
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait RtuResetProcessSystemHandler: Send + Sync {
 	async fn handle_reset_process(
 		&self,

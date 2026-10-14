@@ -152,6 +152,10 @@ pub enum ReceiveHandlerCommand {
 }
 
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait ReceiveHandlerCallback: Send + Sync {
 	async fn on_new_objects(&self, asdu: Asdu);
 }
@@ -289,7 +293,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 							let _ = reply.send(ack);
 						}
 						ReceiveHandlerCommand::Stop => {
-							send_frame(&mut self.write_connection, &STOP_DT_ACT_FRAME).await.whatever_context("Error sending stopDT activation")?;
+							send_frame(&mut *self.write_connection, &STOP_DT_ACT_FRAME).await.whatever_context("Error sending stopDT activation")?;
 							self.confirm_all_messages().await.whatever_context("Error confirming all messages")?;
 							self.t1_u.as_mut().reset(Instant::now() + self.config.t1);
 						},
@@ -476,7 +480,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 			u.stop_dt_confirmation,
 		) {
 			(true, false, false, false, false, false) => {
-				send_frame(&mut self.write_connection, &TEST_FR_CON_FRAME)
+				send_frame(&mut *self.write_connection, &TEST_FR_CON_FRAME)
 					.await
 					.whatever_context("Error sending testFR confirmation")?;
 				Ok(false)
@@ -491,15 +495,15 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 				// In-session StartDT-ACT is a protocol error per §5.3:
 				// data transfer is already started, so re-confirming would
 				// mask a peer fault. Close the connection instead.
-				whatever!("Received StartDT activation while data transfer is already started")
+				whatever!("Received StartDT activation while data transfer is already started");
 			}
 			(false, false, false, true, false, false) => {
 				// StartDT-CON arriving outside `send_start_dt` is unexpected
 				// for an established session.
-				whatever!("Received unsolicited StartDT confirmation")
+				whatever!("Received unsolicited StartDT confirmation");
 			}
 			(false, false, false, false, true, false) => {
-				send_frame(&mut self.write_connection, &STOP_DT_CON_FRAME)
+				send_frame(&mut *self.write_connection, &STOP_DT_CON_FRAME)
 					.await
 					.whatever_context("Error sending stopDT confirmation")?;
 				Ok(true)
@@ -508,7 +512,9 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 				tracing::debug!("StopDT confirmation");
 				Ok(true)
 			}
-			_ => whatever!("Invalid U-frame: zero or multiple flags set: {u:?}"),
+			_ => {
+				whatever!("Invalid U-frame: zero or multiple flags set: {u:?}");
+			}
 		}
 	}
 
@@ -519,7 +525,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 				"Outstanding test frame confirmation messages is greater than 2. Closing connection"
 			);
 		}
-		send_frame(&mut self.write_connection, &TEST_FR_ACT_FRAME)
+		send_frame(&mut *self.write_connection, &TEST_FR_ACT_FRAME)
 			.await
 			.whatever_context("Error sending test frame")?;
 		self.outstanding_test_fr_con_messages += 1;
@@ -531,7 +537,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 	#[instrument(level = "debug", skip_all)]
 	async fn confirm_all_messages(&mut self) -> Result<(), Error> {
 		send_frame(
-			&mut self.write_connection,
+			&mut *self.write_connection,
 			&Frame::S(SFrame { receive_sequence_number: self.received_counter }),
 		)
 		.await

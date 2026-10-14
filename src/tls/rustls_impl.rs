@@ -150,7 +150,9 @@ fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>, Er
 	let key_file = File::open(path).whatever_context("Failed to read key file")?;
 	match private_key(&mut BufReader::new(key_file)).whatever_context("Invalid key PEM")? {
 		Some(key) => Ok(key),
-		None => whatever!("No private key found in PEM file"),
+		None => {
+			whatever!("No private key found in PEM file");
+		}
 	}
 }
 

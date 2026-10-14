@@ -53,10 +53,11 @@ impl Asdu {
 			let remaining_bytes_size = remaining_bytes.len();
 
 			// Validate the wire layout in one place using checked arithmetic.
-			// A sequence carries one ADDRESS_SIZE IOA followed by `num_objs` payloads
-			// of `object_size` bytes each; a non-sequence is `num_objs` repeats
-			// of `(IOA + payload)`. Both pre-fix branches did
-			// `remaining_bytes_size - ADDRESS_SIZE` which underflows on a malformed
+			// A sequence carries one ADDRESS_SIZE IOA followed by `num_objs`
+			// payloads of `object_size` bytes each; a non-sequence
+			// is `num_objs` repeats of `(IOA + payload)`. Both
+			// pre-fix branches did `remaining_bytes_size -
+			// ADDRESS_SIZE` which underflows on a malformed
 			// short ASDU.
 			let expected = if sequence {
 				(num_objs as usize)

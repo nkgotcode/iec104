@@ -1,19 +1,13 @@
 name: Rust
-
-# Trigger the CI on any tags, pushes to any branch and PRs to any branch.
 on:
   push:
-    branches: ["main"]
-    tags: ["*"]
+    branches: [main]
+    tags: ['fork-v*']
   pull_request:
-    branches: ["*"]
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
+  workflow_dispatch:
 
-# Make sure there is no pipeline running uselessly.
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -22,49 +16,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lints:
-    runs-on: ubuntu-latest
-    container: ghcr.io/mzaniolo/rust:latest
-    strategy:
-      matrix:
-        features: ["", "native_tls", "rustls"]
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
     steps:
-      - uses: actions/checkout@v4
-      - name: Rustfmt
-        shell: bash
-        run: cargo +nightly fmt -- --check
-
-      - name: Clippy
-        shell: bash
-        run: |
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings
-          else
-            cargo clippy --workspace --all-targets -- -D warnings
-          fi
-
-      - name: Udeps
-        if: matrix.features == ''
-        shell: bash
-        run: cargo +nightly udeps
-
-      - name: Typos
-        if: matrix.features == ''
-        uses: crate-ci/typos@v1.39.2
-
-  tests:
-    runs-on: ubuntu-latest
-    container: ghcr.io/mzaniolo/rust:latest
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install nightly-2026-10-13 --profile minimal --component rustfmt
+      - run: cargo +nightly-2026-10-13 fmt -- --check
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
     strategy:
+      fail-fast: false
       matrix:
-        features: ["", "native_tls", "rustls"]
+        features: ['', 'native_tls', 'rustls']
     steps:
-      - uses: actions/checkout@v4
-      - name: Test
-        shell: bash
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sh scripts/check.sh '${{ matrix.features }}'
+  hygiene:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: apt-get update && apt-get install -y --no-install-recommends jq
+      - uses: crate-ci/typos@f6708081b566d3e93f9b6ed2b66235ee47349889 # v1.39.2
+      - run: rustup toolchain install nightly-2026-10-13 --profile minimal
+      - name: Install checksum-pinned cargo-udeps
         run: |
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo nextest --profile ci run --workspace --features "${{ matrix.features }}"
-          else
-            cargo nextest --profile ci run --workspace
-          fi
+          curl --fail --location --retry 2 --max-time 60 \
+            https://github.com/est31/cargo-udeps/releases/download/v0.1.61/cargo-udeps-v0.1.61-x86_64-unknown-linux-gnu.tar.gz \
+            -o /tmp/cargo-udeps.tar.gz
+          echo '458419d47f48bc177e9b895b06abdccb08613f8a2d1b6eaf1729e968c041e03b  /tmp/cargo-udeps.tar.gz' | sha256sum --check --strict
+          tar -xzf /tmp/cargo-udeps.tar.gz -C /tmp ./cargo-udeps-v0.1.61-x86_64-unknown-linux-gnu/cargo-udeps
+          install -m 755 /tmp/cargo-udeps-v0.1.61-x86_64-unknown-linux-gnu/cargo-udeps /usr/local/cargo/bin/cargo-udeps
+      - run: cargo +nightly-2026-10-13 udeps --locked --workspace --all-targets

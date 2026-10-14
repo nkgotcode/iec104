@@ -56,7 +56,9 @@ pub(crate) fn client_auth_paths<'a>(
 			Ok(Some((client_cert.as_path(), client_key.as_path())))
 		}
 		(None, None) => Ok(None),
-		_ => whatever!("Both client key *and* certificate must be specified"),
+		_ => {
+			whatever!("Both client key *and* certificate must be specified");
+		}
 	}
 }
 

@@ -24,8 +24,8 @@ pub struct ProtocolConfig {
 	/// On the **server**, outgoing ASDUs beyond this limit are queued per
 	/// connection until the peer acknowledges with I/S frames (up to
 	/// [`Self::max_pending_outgoing_asdu`]). On the **client**,
-	/// [`crate::Client::send_asdu`] fails with `OutputBufferFull` while the `k`
-	/// window is full instead of enqueueing.
+	/// [`crate::client::Client::send_asdu`] fails with `OutputBufferFull` while
+	/// the `k` window is full instead of enqueueing.
 	#[serde(default = "default_number::<12>")]
 	pub k: u16,
 	/// Latest acknowledge after receiving w I format APDUs. Default is 8
@@ -33,9 +33,10 @@ pub struct ProtocolConfig {
 	pub w: u16,
 	/// Maximum ASDUs queued per connection waiting for `k` window space (server
 	/// and client receive-handler). When full,
-	/// [`crate::server::ConnectionHandler::send_asdu`] and
-	/// [`crate::Client::send_asdu`] fail so upper layers can back off. Default
-	/// **1024**. Use **0** for no limit (not recommended on untrusted peers).
+	/// [`crate::server::Server::send_asdu`] and
+	/// [`crate::client::Client::send_asdu`] fail so upper layers can back off.
+	/// Default **1024**. Use **0** for no limit (not recommended on
+	/// untrusted peers).
 	#[serde(default = "default_max_pending_outgoing_asdu")]
 	pub max_pending_outgoing_asdu: u32,
 	/// The originator address for the IEC 104 connection.

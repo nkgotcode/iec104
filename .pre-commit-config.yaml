@@ -19,7 +19,7 @@ repos:
       - id: fmt
         name: fmt
         description: Format files with cargo fmt.
-        entry: cargo +nightly fmt
+        entry: cargo +nightly-2026-10-13 fmt
         language: system
         types: [rust]
         args: ["--", "--check"]
@@ -28,7 +28,7 @@ repos:
         description: Lint rust sources
         entry: cargo clippy
         language: system
-        args: ["--workspace", "--all-targets", "--", "-D", "warnings"]
+        args: ["--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
         types: [rust]
         pass_filenames: false
   - repo: https://github.com/DevinR528/cargo-sort

@@ -26,7 +26,8 @@ const GLOBAL_COMMON_ADDRESS: u16 = 0xFFFF;
 fn max_objects_fitting_apdu(type_id: TypeId) -> usize {
 	let per_object = ADDRESS_SIZE + type_id.size();
 	let available = APUD_MAX_LENGTH as usize - CONTROL_FIELDS_SIZE - ASDU_HEADER_SIZE;
-	// Standard monitoring types always fit at least one object; guard `chunks(0)`.
+	// Standard monitoring types always fit at least one object; guard
+	// `chunks(0)`.
 	let by_bytes = (available / per_object).max(1);
 	by_bytes.min(MAX_OBJECTS_PER_ASDU)
 }

@@ -50,8 +50,8 @@ impl Apdu {
 	}
 
 	pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-		// The total length of the APDU is the length of the frame plus the start
-		// byte and the length octet
+		// The total length of the APDU is the length of the frame plus the
+		// start byte and the length octet
 		let mut bytes = Vec::with_capacity(self.length as usize + APDU_HEADER_SIZE);
 		bytes.push(TELEGRAM_HEADER);
 		bytes.push(self.length);

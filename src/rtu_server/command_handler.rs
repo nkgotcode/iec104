@@ -32,7 +32,7 @@ pub struct CommandContext<'a> {
 /// [`crate::cot::Cot::ActivationConfirmation`] or
 /// [`crate::cot::Cot::DeactivationConfirmation`] depending on the incoming
 /// command [`crate::cot::Cot`] (see
-/// [`super::commands::send_command_confirmation`]).
+/// `send_command_confirmation`).
 #[derive(Debug, Clone)]
 pub struct CommandHandling {
 	/// `true` = negative confirm (e.g. unknown command or interlock).
@@ -48,6 +48,10 @@ pub struct CommandHandling {
 }
 
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait RtuCommandHandler: Send + Sync {
 	/// Decide confirmation and any process-image updates for this command ASDU.
 	async fn handle_command(&self, ctx: CommandContext<'_>) -> CommandHandling;

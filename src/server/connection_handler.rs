@@ -116,11 +116,12 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerConnectionHandler<C> {
 					.whatever_context("Timeout waiting for startDT activation")?
 					.whatever_context("Error receiving APDU")?;
 
-					// Per IEC 60870-5-104 §5.3, before data transfer begins only
-					// U-frames are valid. StartDT-ACT advances to the started
+					// Per IEC 60870-5-104 §5.3, before data transfer begins
+					// only U-frames are valid. StartDT-ACT
+					// advances to the started
 					// state; TestFR-ACT must always be answered with TestFR-CON
-					// regardless of state. Anything else is a protocol violation
-					// and closes the connection.
+					// regardless of state. Anything else is a protocol
+					// violation and closes the connection.
 					match apdu.frame {
 						Frame::U(u) if u.start_dt_activation => {
 							send_frame(&mut self.write_connection, &START_DT_CON_FRAME)
@@ -136,10 +137,12 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerConnectionHandler<C> {
 								.await
 								.whatever_context("Error sending testFR confirmation")?;
 						}
-						_ => whatever!(
-							"Unexpected frame while waiting for startDT activation: {:?}",
-							apdu.frame
-						),
+						_ => {
+							whatever!(
+								"Unexpected frame while waiting for startDT activation: {:?}",
+								apdu.frame
+							);
+						}
 					}
 				}
 				ConnectionState::Started => {

@@ -229,9 +229,9 @@ impl Cp56Time2a {
 	/// Convert to a timezone-aware datetime using the provided timezone or UTC
 	/// offset.
 	///
-	/// The `tz` argument accepts any [`chrono::TimeZone`] (e.g.
+	/// The `tz` argument accepts any `chrono::TimeZone` (e.g.
 	/// `chrono::Utc`, `chrono::Local`, or a `chrono_tz` zone) when the
-	/// `chrono` feature is enabled, and [`time::UtcOffset`] (e.g.
+	/// `chrono` feature is enabled, and `time::UtcOffset` (e.g.
 	/// `time::UtcOffset::UTC`) when the `time` feature is enabled.
 	///
 	/// Returns an error if the [`Cp56Time2a::iv`] flag is set or if the
@@ -395,9 +395,9 @@ mod sealed {
 /// Timezone or UTC-offset type accepted by [`Cp56Time2a::to_datetime`].
 ///
 /// Implemented for:
-/// - [`chrono::Utc`], [`chrono::Local`], and [`chrono::FixedOffset`] when the
+/// - `chrono::Utc`, `chrono::Local`, and `chrono::FixedOffset` when the
 ///   `chrono` feature is enabled.
-/// - [`time::UtcOffset`] when the `time` feature is enabled.
+/// - `time::UtcOffset` when the `time` feature is enabled.
 ///
 /// This trait is sealed — it cannot be implemented outside this crate.
 pub trait IecTimezone: sealed::Sealed {

@@ -32,6 +32,10 @@ impl ConnectionId {
 }
 
 #[async_trait::async_trait]
+#[expect(
+	clippy::double_must_use,
+	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
+)]
 pub trait ServerCallback {
 	async fn on_new_objects(&self, asdu: Asdu, id: ConnectionId, address: SocketAddr);
 	async fn on_new_connection(&self, address: SocketAddr) {
