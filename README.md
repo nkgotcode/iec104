@@ -84,6 +84,48 @@ Client reconnection creates fresh sequence state and rejects queued commands
 from the previous connection. There is no implicit command replay across a
 connection loss. A successful local send is not proof of remote execution.
 
+## Deferred commands and selection
+
+Override `RtuCommandHandler::prepare_command` to return either an immediate
+`CommandHandling` result or `CommandDispatch::Deferred(DeferredCommand::new(...))`.
+Preparation must not actuate. The deferred future is first polled after a positive
+ACT_CON enters the link queue; successful completion emits ACT_TERM. This is local
+admission, not proof that the peer has received the confirmation. Existing
+`handle_command` implementations remain supported as immediate handlers.
+
+Command work is bounded by `command_capacity`, with at most one in flight per
+connection. Telemetry and interrogation continue while a command future waits.
+`command_timeout` (default 10 seconds) applies separately to preparation and
+execution. Preparation timeout rejects the command. Failure, panic, invalid
+completion updates or timeout after acceptance closes the connection; it never
+claims successful completion or invents a type-independent negative ACT_TERM.
+Connection loss means the external outcome may be unknown. The application must
+implement its own recovery and idempotency policy before retrying an operation.
+
+`CommandContext::session` is permanently cancelled on STOPDT, disconnect or
+shutdown. Restart creates a fresh session token. Owned futures are cancelled and
+joined during shutdown, and guarded replies queued behind a full transmit window
+cannot leak into a restarted session. Dropping a future cannot undo an external
+action already performed: adapters must honour cancellation and must not detach
+untracked actuator tasks.
+
+Preparation sees a model snapshot. Immediate updates are rejected if their target
+has changed since that snapshot; all updates are validated before mutation.
+Negative replies never apply updates. Commands must contain one object; test,
+negative and Request-COT process commands are rejected without invoking execution.
+
+Wrap a handler with `SelectBeforeExecute::new(handler, timeout, capacity)` for
+mandatory selection. The handler must explicitly authorize `select` without
+actuating. Reservations are bounded, expire, belong to one data-transfer session,
+and are consumed once. Type, common address, IOA, originator, value, qualifier and
+timestamp must match exactly except for the S/E bit. Wrong-master/value/address
+executions, expired selections and duplicate executes are rejected. Deactivation
+cancels a matching reservation. Bitstring commands have no S/E field and are
+rejected by this wrapper. `SelectionState` is also available for custom policies.
+
+These mechanisms provide protocol lifecycle management, not application
+permission checks, interlocks or equipment safety logic.
+
 ## Explicit system-command policy
 
 `RtuSystemHandlers::monitoring_only()` allows test/read requests and ordinary
@@ -145,6 +187,27 @@ iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["native_tls"
 iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["rustls"] }
 ```
 
+## TLS client authentication and admission
+
+With `rustls`, set `TlsServerConfig.client_ca_certificates` to a PEM trust bundle
+to **require** a valid client certificate. Missing, untrusted and expired client
+certificates fail the TLS handshake. An unreadable or empty trust bundle fails
+server construction. `None` keeps server-only TLS; it does not authenticate clients.
+The `native_tls` backend rejects a required client-authentication configuration
+instead of silently accepting unauthenticated clients.
+
+Low-level `ServerCallback::authorize_peer` receives a `PeerIdentity` before
+STARTDT or ASDU processing. Its `verified_client_certificate_der` is the verified
+leaf certificate when required client authentication succeeds; `encrypted` alone
+is not proof of client identity. Return `false` to close the connection. The default
+returns `true`, admitting all peers that satisfy the transport policy. This callback
+and `on_new_connection` run in the individual connection task, with a combined
+`tls_handshake_timeout` deadline; a blocked admission callback does not stall other
+connections. The RTU convenience API enforces the configured TLS trust policy;
+custom per-certificate admission uses the low-level server API.
+
+This is a transport admission mechanism, not a claim of IEC 62351 conformance.
+
 ## Requirements
 
 - **Rust** with support for the edition and features declared in `Cargo.toml` (currently **Edition 2024**).
@@ -155,7 +218,7 @@ iec104 = { git = "https://github.com/nkgotcode/iec104", features = ["rustls"] }
 - **Work in progress:** public APIs and default RTU behavior may change between minor releases until the crate stabilises.
 - **Coverage:** not every standard type ID or edge case is implemented or battle-tested; prefer explicit tests for your IO list.
 - **Low-level `Server`:** does not implement an RTU process image—you get raw ASDUs and must send replies yourself.
-- **Security:** TLS is available for transport when the `native_tls` or `rustls` feature is enabled; application-layer security (authentication, authorisation) is outside IEC 104 and not provided here.
+- **Security:** certificate authentication and connection authorization are available as described above. Application command permissions, credential provisioning/rotation, revocation policy, and IEC 62351 conformance are not provided by this library.
 - **101 / serial:** out of scope.
 
 ## Contributing

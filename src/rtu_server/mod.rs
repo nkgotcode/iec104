@@ -23,8 +23,7 @@
 //! [`RtuInitialPoint::with_counter_interrogation_group`] or
 //! [`RtuServerHandle::register_point_with_counter_interrogation_group`].
 //!
-//! **Commands** ([`Cot::Request`](crate::cot::Cot::Request),
-//! [`Cot::Activation`](crate::cot::Cot::Activation), or
+//! **Commands** ([`Cot::Activation`](crate::cot::Cot::Activation) or
 //! [`Cot::Deactivation`](crate::cot::Cot::Deactivation) for
 //! supported `C_SC_*`, `C_DC_*`, `C_RC_*`, `C_SE_*`, `C_BO_*`): the standard
 //! defines the telegram, not what it must do in your plant. You supply an
@@ -62,11 +61,13 @@
 mod actor;
 mod command_handler;
 mod command_presets;
+mod command_work;
 mod commands;
 mod error;
 mod model;
 mod output;
 mod point_value;
+mod selection;
 mod system_command_handler;
 
 use std::{
@@ -75,9 +76,12 @@ use std::{
 };
 
 pub use command_handler::{
-	CommandContext, CommandHandling, RejectAllCommands, RtuCommandHandler, command_handler_from_fn,
+	CommandCompletion, CommandContext, CommandDispatch, CommandHandling, CommandSession,
+	DeferredCommand, RejectAllCommands, RtuCommandHandler, command_handler_from_fn,
 };
 pub use command_presets::MapCommandsToSameIoaMonitoring;
+pub use selection::{SelectBeforeExecute, SelectionState};
+tokio::task_local! { static COMMAND_OWNER: tokio::task::Id; }
 pub use error::{RtuHandleError, SetPointError};
 pub use model::{PointAddress, PointValue, RtuInitialMaps, RtuInitialPoint};
 use snafu::{ResultExt as _, whatever};
@@ -182,14 +186,20 @@ impl RtuServer {
 	) -> Result<RtuServerHandle, Error> {
 		let RtuInitialMaps { points, interrogation_groups, counter_groups } =
 			build_rtu_initial_maps(initial_points)?;
-		if config.rtu_queue_capacity == 0 {
+		if config.rtu_queue_capacity == 0 || config.command_timeout.is_zero() {
 			whatever!("RTU mailbox capacity must be nonzero");
 		}
 		let (tx, rx) = tokio::sync::mpsc::channel(config.rtu_queue_capacity);
+		let capacity = config.command_capacity;
+		let command_timeout = config.command_timeout;
+		let (stop, stopped) = tokio::sync::watch::channel(());
 		let ingress = actor::NetworkIngress::new(tx.clone());
 		let server = crate::server::Server::start(config, ingress).await?;
 		let server_for_actor = server.clone();
 		let task = tokio::spawn(actor::run_actor(
+			stopped,
+			capacity,
+			command_timeout,
 			rx,
 			server_for_actor,
 			points,
@@ -198,7 +208,7 @@ impl RtuServer {
 			command_handler,
 			system_handlers,
 		));
-		Ok(RtuServerHandle::new(tx, server, task))
+		Ok(RtuServerHandle::new(tx, server, task, stop))
 	}
 }
 
@@ -217,15 +227,21 @@ pub async fn start_rtu_server_ephemeral(
 	server_config.port = 0;
 	let RtuInitialMaps { points, interrogation_groups, counter_groups } =
 		build_rtu_initial_maps(initial_points)?;
-	if server_config.rtu_queue_capacity == 0 {
+	if server_config.rtu_queue_capacity == 0 || server_config.command_timeout.is_zero() {
 		whatever!("RTU mailbox capacity must be nonzero");
 	}
 	let (tx, rx) = tokio::sync::mpsc::channel(server_config.rtu_queue_capacity);
+	let capacity = server_config.command_capacity;
+	let command_timeout = server_config.command_timeout;
+	let (stop, stopped) = tokio::sync::watch::channel(());
 	let ingress = actor::NetworkIngress::new(tx.clone());
 	let (server, listen_addr) =
 		crate::server::Server::start_with_listen_addr(server_config, ingress).await?;
 	let server_for_actor = server.clone();
 	let task = tokio::spawn(actor::run_actor(
+		stopped,
+		capacity,
+		command_timeout,
 		rx,
 		server_for_actor,
 		points,
@@ -234,7 +250,7 @@ pub async fn start_rtu_server_ephemeral(
 		command_handler,
 		system_handlers,
 	));
-	Ok((RtuServerHandle::new(tx, server, task), listen_addr))
+	Ok((RtuServerHandle::new(tx, server, task, stop), listen_addr))
 }
 
 /// `Clone` handle for updates from any task (e.g. NATS subscriber). Sends into
@@ -247,6 +263,7 @@ pub struct RtuServerHandle {
 }
 
 struct RtuLifecycle {
+	stop: tokio::sync::watch::Sender<()>,
 	server: crate::server::Server,
 	abort: tokio::task::AbortHandle,
 	task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -254,7 +271,8 @@ struct RtuLifecycle {
 
 impl Drop for RtuLifecycle {
 	fn drop(&mut self) {
-		self.abort.abort();
+		self.stop.send_replace(());
+		self.server.request_shutdown();
 	}
 }
 
@@ -269,11 +287,13 @@ impl RtuServerHandle {
 		tx: tokio::sync::mpsc::Sender<actor::ActorMsg>,
 		server: crate::server::Server,
 		task: tokio::task::JoinHandle<()>,
+		stop: tokio::sync::watch::Sender<()>,
 	) -> Self {
 		let abort = task.abort_handle();
 		Self {
 			tx,
 			lifecycle: Arc::new(RtuLifecycle {
+				stop,
 				server,
 				abort,
 				task: tokio::sync::Mutex::new(Some(task)),
@@ -287,7 +307,9 @@ impl RtuServerHandle {
 	/// handle cancels the actor and requests network cleanup without joining.
 	pub async fn shutdown(&self) -> Result<(), Error> {
 		self.request_shutdown();
-		if tokio::task::try_id() == Some(self.lifecycle.abort.id()) {
+		if tokio::task::try_id() == Some(self.lifecycle.abort.id())
+			|| COMMAND_OWNER.try_with(|owner| *owner == self.lifecycle.abort.id()).unwrap_or(false)
+		{
 			whatever!("Shutdown requested from an RTU callback; join from an external task");
 		}
 		let server_result = self.lifecycle.server.shutdown().await;
@@ -308,7 +330,7 @@ impl RtuServerHandle {
 	/// Await [`Self::shutdown`] from an external task to join cleanup.
 	pub fn request_shutdown(&self) {
 		self.lifecycle.server.request_shutdown();
-		self.lifecycle.abort.abort();
+		self.lifecycle.stop.send_replace(());
 	}
 
 	/// Update an existing point and broadcast a spontaneous ASDU to all started

@@ -5,7 +5,8 @@ use std::{
 };
 
 use super::{
-	command_handler::RtuCommandHandler,
+	command_handler::{CommandSession, RtuCommandHandler},
+	command_work::CommandWork,
 	commands,
 	error::{InterrogationError, SetPointError},
 	model::{PointAddress, PointValue, RtuInitialPoint},
@@ -30,6 +31,7 @@ pub(crate) enum ActorMsg {
 		asdu: Asdu,
 		connection_id: ConnectionId,
 		peer: SocketAddr,
+		session: CommandSession,
 	},
 	SetPoint {
 		address: PointAddress,
@@ -57,6 +59,7 @@ pub(crate) enum ActorMsg {
 	/// TCP + STARTDT completed; send [`TypeId::M_EI_NA_1`] to this peer.
 	ConnectionStarted {
 		connection_id: ConnectionId,
+		session: CommandSession,
 		initialized: Arc<std::sync::atomic::AtomicBool>,
 	},
 }
@@ -88,62 +91,102 @@ pub(crate) enum RegisterPointError {
 	CounterGroupRequiresCounterPoint,
 }
 
-#[derive(Clone)]
-pub(super) struct NetworkIngress {
-	initialized: Arc<std::sync::Mutex<HashMap<ConnectionId, Arc<std::sync::atomic::AtomicBool>>>>,
-	tx: tokio::sync::mpsc::Sender<ActorMsg>,
+#[derive(Default)]
+struct SessionEntry {
+	initialized: Arc<std::sync::atomic::AtomicBool>,
+	active: Option<CommandSession>,
 }
-
-impl NetworkIngress {
-	pub(super) fn new(tx: tokio::sync::mpsc::Sender<ActorMsg>) -> Self {
-		Self { tx, initialized: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+#[derive(Default)]
+struct Sessions(HashMap<ConnectionId, SessionEntry>);
+impl Drop for Sessions {
+	fn drop(&mut self) {
+		for entry in self.0.values() {
+			if let Some(session) = &entry.active {
+				session.cancel();
+			}
+		}
 	}
 }
-
+#[derive(Clone)]
+pub(super) struct NetworkIngress {
+	tx: tokio::sync::mpsc::Sender<ActorMsg>,
+	sessions: Arc<std::sync::Mutex<Sessions>>,
+}
+impl NetworkIngress {
+	pub(super) fn new(tx: tokio::sync::mpsc::Sender<ActorMsg>) -> Self {
+		Self { tx, sessions: Arc::new(std::sync::Mutex::new(Sessions::default())) }
+	}
+}
 #[async_trait::async_trait]
 impl ServerCallback for NetworkIngress {
-	async fn on_new_objects(&self, asdu: Asdu, connection_id: ConnectionId, peer: SocketAddr) {
-		let _ = self.on_new_objects_checked(asdu, connection_id, peer).await;
+	async fn on_new_objects(&self, asdu: Asdu, id: ConnectionId, peer: SocketAddr) {
+		let _ = self.on_new_objects_checked(asdu, id, peer).await;
 	}
 	async fn on_new_objects_checked(
 		&self,
 		asdu: Asdu,
-		connection_id: ConnectionId,
+		id: ConnectionId,
 		peer: SocketAddr,
 	) -> Result<(), crate::error::Error> {
-		use snafu::ResultExt as _;
+		use snafu::{OptionExt as _, ResultExt as _};
+		let session = self
+			.sessions
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.0
+			.get(&id)
+			.and_then(|entry| entry.active.clone())
+			.whatever_context("No active command session")?;
 		self.tx
-			.try_send(ActorMsg::IngressAsdu { asdu, connection_id, peer })
+			.try_send(ActorMsg::IngressAsdu { asdu, connection_id: id, peer, session })
 			.whatever_context("RTU ingress unavailable or overloaded")
 	}
 	async fn on_connection_started_checked(
 		&self,
-		connection_id: ConnectionId,
+		id: ConnectionId,
 		_: SocketAddr,
 	) -> Result<(), crate::error::Error> {
 		use snafu::ResultExt as _;
-		let mut initialized =
-			self.initialized.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		let initialized = initialized.entry(connection_id).or_default();
-		if !initialized.load(std::sync::atomic::Ordering::Relaxed) {
+		let mut sessions = self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		let entry = sessions.0.entry(id).or_default();
+		let session = CommandSession::new();
+		if !entry.initialized.load(std::sync::atomic::Ordering::Relaxed) {
 			self.tx
 				.try_send(ActorMsg::ConnectionStarted {
-					connection_id,
-					initialized: initialized.clone(),
+					connection_id: id,
+					session: session.clone(),
+					initialized: entry.initialized.clone(),
 				})
 				.whatever_context("RTU ingress unavailable or overloaded")?;
 		}
+		if let Some(previous) = entry.active.replace(session) {
+			previous.cancel();
+		}
 		Ok(())
 	}
-	async fn on_connection_disconnected(&self, connection_id: ConnectionId, _: SocketAddr) {
-		self.initialized
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner)
-			.remove(&connection_id);
+	async fn on_connection_stopped(&self, id: ConnectionId, _: SocketAddr) {
+		if let Some(entry) =
+			self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.get_mut(&id)
+			&& let Some(session) = entry.active.take()
+		{
+			session.cancel();
+		}
+	}
+	fn on_connection_closed(&self, id: ConnectionId, _: SocketAddr) {
+		if let Some(entry) =
+			self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.remove(&id)
+			&& let Some(session) = entry.active
+		{
+			session.cancel();
+		}
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_actor(
+	mut stopped: tokio::sync::watch::Receiver<()>,
+	capacity: usize,
+	command_timeout: std::time::Duration,
 	mut rx: tokio::sync::mpsc::Receiver<ActorMsg>,
 	server: Server,
 	mut model: HashMap<PointAddress, PointValue>,
@@ -152,8 +195,16 @@ pub(super) async fn run_actor(
 	command_handler: Arc<dyn RtuCommandHandler>,
 	system_handlers: RtuSystemHandlers,
 ) {
+	let mut work = CommandWork::new(capacity, command_timeout);
+	tokio::select! {biased;
+		_=stopped.changed()=>{},
+		()=async {
 	let mut last_master_clock: Option<Cp56Time2a> = None;
-	while let Some(msg) = rx.recv().await {
+	loop {
+		let msg=tokio::select! {
+			result=work.next(),if !work.is_empty()=>{if let Some(result)=result {work.finish(result,&server,&mut model).await;}continue;},
+			msg=rx.recv()=>{let Some(msg)=msg else{break;};msg},
+		};
 		match msg {
 			ActorMsg::SetPoint { address, value, reply } => {
 				let res = handle_set_point(&mut model, &server, address, value).await;
@@ -198,31 +249,29 @@ pub(super) async fn run_actor(
 				counter_groups.clear();
 				let _ = reply.send(n);
 			}
-			ActorMsg::IngressAsdu { asdu, connection_id, peer } => {
+			ActorMsg::IngressAsdu { asdu, connection_id, peer, session } => {
+				if !session.is_active(){continue;}
+				if commands::is_process_command(&asdu){work.admit(&server,command_handler.clone(),&model,asdu,connection_id,peer,session).await;continue;}
 				handle_ingress_asdu(
 					&mut model,
 					&interrogation_groups,
 					&counter_groups,
 					&server,
-					&command_handler,
 					&system_handlers,
 					&mut last_master_clock,
 					asdu,
 					connection_id,
 					peer,
-				)
-				.await;
+				).await;
 			}
-			ActorMsg::ConnectionStarted { connection_id, initialized } => {
-				if !initialized.load(std::sync::atomic::Ordering::Relaxed)
-					&& send_end_of_initialization(&model, &server, connection_id).await
-				{
-					initialized.store(true, std::sync::atomic::Ordering::Relaxed);
-				}
+			ActorMsg::ConnectionStarted { connection_id, session, initialized } => {
+				if session.is_active() && !initialized.load(std::sync::atomic::Ordering::Relaxed) && send_end_of_initialization(&model,&server,connection_id).await {initialized.store(true,std::sync::atomic::Ordering::Relaxed);}
 			}
 		}
 	}
-	tracing::warn!("RTU actor channel closed; stopping model loop");
+		}=>{},
+	}
+	work.shutdown().await;
 }
 
 fn register_one_point(
@@ -365,7 +414,6 @@ async fn handle_ingress_asdu(
 	interrogation_groups: &HashMap<PointAddress, u8>,
 	counter_groups: &HashMap<PointAddress, u8>,
 	server: &Server,
-	command_handler: &Arc<dyn RtuCommandHandler>,
 	system_handlers: &RtuSystemHandlers,
 	last_master_clock: &mut Option<Cp56Time2a>,
 	asdu: Asdu,
@@ -375,20 +423,6 @@ async fn handle_ingress_asdu(
 	let sys_cot = is_system_command_cot(asdu.cot);
 
 	match asdu.type_id {
-		_ if commands::is_process_command(&asdu) => {
-			if let Err(e) = commands::handle_process_command(
-				model,
-				server,
-				&asdu,
-				connection_id,
-				peer,
-				command_handler,
-			)
-			.await
-			{
-				tracing::error!(error = ?e, ?peer, "process command handling");
-			}
-		}
 		tid @ (TypeId::C_TS_NA_1
 		| TypeId::C_TS_TA_1
 		| TypeId::C_RD_NA_1

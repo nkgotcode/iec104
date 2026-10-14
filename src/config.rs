@@ -158,11 +158,21 @@ pub struct ServerConfig {
 	/// local operations return Overloaded. Must be nonzero. Default 1024.
 	#[serde(default = "default_rtu_capacity")]
 	pub rtu_queue_capacity: usize,
+	/// Deadline for command preparation and for deferred completion. Must be
+	/// nonzero. Timeout before acceptance rejects; after acceptance closes the
+	/// peer.
+	#[serde(with = "humantime_serde", default = "default_duration::<10>")]
+	pub command_timeout: Duration,
 }
 
 /// The server TLS configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TlsServerConfig {
+	/// PEM trust anchors for required client-certificate authentication.
+	/// None preserves server-only TLS. Supported by rustls; native_tls rejects
+	/// this setting instead of silently allowing unauthenticated clients.
+	#[serde(default)]
+	pub client_ca_certificates: Option<PathBuf>,
 	/// Path to the server certificate.
 	pub server_certificate: PathBuf,
 	/// Path to the server key
@@ -207,6 +217,7 @@ impl Default for ServerConfig {
 			command_capacity: default_command_capacity(),
 			delivery_timeout: Duration::from_secs(1),
 			rtu_queue_capacity: default_rtu_capacity(),
+			command_timeout: Duration::from_secs(10),
 			tls_handshake_timeout: Duration::from_secs(10),
 		}
 	}

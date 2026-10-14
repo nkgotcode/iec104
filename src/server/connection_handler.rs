@@ -20,7 +20,7 @@ use crate::{
 	receive_handler::{
 		ReceiveHandler, ReceiveHandlerCommand, SendAsduQueueError, receive_apdu, send_frame,
 	},
-	server::{InnerServerCallback, ServerCallback, error},
+	server::{InnerServerCallback, PeerIdentity, ServerCallback, error},
 };
 
 #[atomic_enum]
@@ -47,16 +47,21 @@ impl Drop for ConnectionHandler {
 }
 
 struct ClosedNotification {
+	on_close: Option<Box<dyn FnOnce() + Send>>,
 	id: ConnectionId,
 	tx: mpsc::UnboundedSender<ConnectionId>,
 }
 impl Drop for ClosedNotification {
 	fn drop(&mut self) {
+		if let Some(on_close) = self.on_close.take() {
+			on_close();
+		}
 		let _ = self.tx.send(self.id);
 	}
 }
 
 struct InnerConnectionHandler<C: ServerCallback + Send + Sync + 'static> {
+	identity: PeerIdentity,
 	read_connection: ReadHalf<Connection>,
 	write_connection: WriteHalf<Connection>,
 	callback: Arc<InnerServerCallback<C>>,
@@ -76,10 +81,21 @@ impl ConnectionHandler {
 		callback: InnerServerCallback<C>,
 		tx: mpsc::UnboundedSender<ConnectionId>,
 	) -> Self {
+		let identity = match &connection {
+			Connection::Tcp(_) => {
+				PeerIdentity { encrypted: false, verified_client_certificate_der: None }
+			}
+			#[cfg(any(feature = "native_tls", feature = "rustls"))]
+			Connection::Tls(stream) => PeerIdentity {
+				encrypted: true,
+				verified_client_certificate_der: stream.verified_client_certificate(),
+			},
+		};
 		let (read_connection, write_connection) = tokio::io::split(connection);
 		let (cmd_tx, rx) = mpsc::channel(config.command_capacity);
 		let state = callback.state.clone();
 		let inner_connection_handler = InnerConnectionHandler {
+			identity,
 			read_connection,
 			write_connection,
 			callback: Arc::new(callback),
@@ -89,7 +105,12 @@ impl ConnectionHandler {
 			address,
 			state: state.clone(),
 		};
-		let closed = ClosedNotification { id, tx };
+		let callback = inner_connection_handler.callback.clone();
+		let closed = ClosedNotification {
+			id,
+			tx,
+			on_close: Some(Box::new(move || callback.callback.on_connection_closed(id, address))),
+		};
 		let owner = tokio::task::id();
 		let task = tokio::spawn(super::CALLBACK_OWNER.scope(owner, async move {
 			let _closed = closed;
@@ -114,13 +135,18 @@ impl ConnectionHandler {
 	pub fn enqueue_asdu(
 		&self,
 		asdu: Asdu,
+		guard: Option<tokio::sync::watch::Receiver<bool>>,
 	) -> Result<oneshot::Receiver<Result<(), SendAsduQueueError>>, error::ServerError> {
 		if !self.is_started() {
 			return error::NotStarted.fail();
 		}
 		let (reply_tx, reply_rx) = oneshot::channel();
-		match self.tx.try_send(ReceiveHandlerCommand::Asdu { asdu, session: None, reply: reply_tx })
-		{
+		match self.tx.try_send(ReceiveHandlerCommand::Asdu {
+			asdu,
+			session: None,
+			guard,
+			reply: reply_tx,
+		}) {
 			Ok(()) => Ok(reply_rx),
 			Err(mpsc::error::TrySendError::Full(_)) => error::Overloaded.fail(),
 			Err(mpsc::error::TrySendError::Closed(cmd)) => {
@@ -156,6 +182,15 @@ impl ConnectionHandler {
 
 impl<C: ServerCallback + Send + Sync + 'static> InnerConnectionHandler<C> {
 	pub async fn start(mut self) -> Result<(), Error> {
+		let authorized = tokio::time::timeout(self.config.tls_handshake_timeout, async {
+			self.callback.callback.on_new_connection(self.address).await;
+			self.callback.callback.authorize_peer(self.id, self.address, &self.identity).await
+		})
+		.await
+		.whatever_context("Peer admission callback timed out")?;
+		if !authorized {
+			whatever!("Peer authorization denied");
+		}
 		let mut buffer = [0; MAX_APDU_FRAME_SIZE];
 		let out_buffer_full = Arc::new(AtomicBool::new(false));
 

@@ -199,9 +199,14 @@ impl<C: ClientCallback + Send + Sync + 'static> Client<C> {
 
 		if let Some(tx) = &self.write_tx {
 			let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-			tx.send(ReceiveHandlerCommand::Asdu { asdu, session: Some(session), reply: reply_tx })
-				.await
-				.context(errors::SendCommand)?;
+			tx.send(ReceiveHandlerCommand::Asdu {
+				asdu,
+				session: Some(session),
+				guard: None,
+				reply: reply_tx,
+			})
+			.await
+			.context(errors::SendCommand)?;
 			match reply_rx.await.context(errors::ReceiveHandlerAsduAck)? {
 				Ok(()) => Ok(()),
 				Err(SendAsduQueueError::NotStarted) => errors::NotReceiving.fail(),
@@ -535,6 +540,7 @@ mod session_tests {
 				.send(ReceiveHandlerCommand::Asdu {
 					asdu: sample.clone(),
 					session: Some(old_session),
+					guard: None,
 					reply,
 				})
 				.await
