@@ -111,3 +111,12 @@ fn outgoing_objects_reject_truncated_addresses_and_mismatched_types() {
 	}
 	assert!(asdu.to_bytes(&mut Vec::new()).is_err());
 }
+
+#[test]
+fn custom_single_object_sequence_can_be_forwarded() {
+	let bytes = [200, 0x81, 3, 0, 1, 0, 1, 0, 0, 0xaa, 0xbb];
+	let asdu = Asdu::parse(&bytes).expect("custom SQ ASDU");
+	let mut encoded = Vec::new();
+	asdu.to_bytes(&mut encoded).expect("forward custom SQ ASDU");
+	assert_eq!(encoded, bytes);
+}

@@ -165,8 +165,8 @@ macro_rules! define_information_objects {
 				match self {
 					$( Self::$variant(objs) if type_id == TypeId::$type_id =>
 						Self::serialize_objects(objs, sequence, buffer), )*
-					Self::Raw(objs) if !type_id.is_standard() && !sequence =>
-						Self::serialize_objects(objs, false, buffer),
+					Self::Raw(objs) if !type_id.is_standard() =>
+						Self::serialize_objects(objs, sequence, buffer),
 					_ => super::InvalidType.fail(),
 				}
 			}
