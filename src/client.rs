@@ -65,8 +65,9 @@ struct InnerClientCallback<C: ClientCallback + Send + Sync> {
 
 #[async_trait::async_trait]
 impl<C: ClientCallback + Send + Sync> ReceiveHandlerCallback for InnerClientCallback<C> {
-	async fn on_new_objects(&self, asdu: Asdu) {
+	async fn on_new_objects(&self, asdu: Asdu) -> Result<(), Error> {
 		self.callback.on_new_objects(asdu).await;
+		Ok(())
 	}
 }
 

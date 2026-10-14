@@ -157,7 +157,7 @@ pub enum ReceiveHandlerCommand {
 	reason = "async-trait 0.1.89 generates redundant must_use on boxed futures"
 )]
 pub trait ReceiveHandlerCallback: Send + Sync {
-	async fn on_new_objects(&self, asdu: Asdu);
+	async fn on_new_objects(&self, asdu: Asdu) -> Result<(), Error>;
 }
 
 pub struct ReceiveHandler<'a, C: ReceiveHandlerCallback> {
@@ -264,7 +264,7 @@ impl<'a, C: ReceiveHandlerCallback> ReceiveHandler<'a, C> {
 								if self.unacknowledged_rcv_frames >= self.config.w {
 									self.confirm_all_messages().await?;
 								}
-								self.callback.on_new_objects(i.asdu).await;
+								self.callback.on_new_objects(i.asdu).await?;
 							}
 							Frame::S(s) => {
 								self.handle_receive_s_frame(&s)?;

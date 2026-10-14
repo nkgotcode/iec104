@@ -249,3 +249,111 @@ async fn client_shutdown_interrupts_reconnect_wait() {
 		.expect("shutdown");
 	assert!(rx.try_recv().is_err(), "no new callbacks after shutdown");
 }
+
+struct ShutdownFromCallback {
+	server: Arc<tokio::sync::Mutex<Option<Server>>>,
+	result: mpsc::UnboundedSender<bool>,
+	when: u8,
+}
+impl ShutdownFromCallback {
+	async fn stop(&self) {
+		let server = self.server.lock().await.clone().expect("server installed");
+		let rejected = server.shutdown().await.is_err();
+		self.result.send(rejected).expect("result receiver");
+	}
+}
+#[async_trait]
+impl ServerCallback for ShutdownFromCallback {
+	async fn on_new_objects(&self, _: Asdu, _: ConnectionId, _: SocketAddr) {
+		if self.when == 3 {
+			self.stop().await;
+		}
+	}
+	async fn on_connection_started(&self, _: ConnectionId, _: SocketAddr) {
+		if self.when == 2 {
+			self.stop().await;
+		}
+	}
+	async fn on_new_connection(&self, _: SocketAddr) {
+		if self.when == 0 {
+			self.stop().await;
+		}
+	}
+	async fn on_connection_stopped(&self, _: ConnectionId, _: SocketAddr) {
+		if self.when == 1 {
+			self.stop().await;
+		}
+	}
+}
+#[tokio::test]
+async fn shutdown_from_server_callback_returns_without_self_joining() {
+	for when in 0..4 {
+		let slot = Arc::new(tokio::sync::Mutex::new(None));
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let (server, addr) = Server::start_with_listen_addr(
+			ServerConfig { port: 0, ..ServerConfig::default() },
+			ShutdownFromCallback { server: slot.clone(), result: tx, when },
+		)
+		.await
+		.expect("server");
+		*slot.lock().await = Some(server.clone());
+		let mut peer = TcpStream::connect(addr).await.expect("connect");
+		if when >= 2 {
+			peer.write_all(&START).await.expect("start");
+			let mut reply = [0; 6];
+			peer.read_exact(&mut reply).await.expect("start confirm");
+			if when == 3 {
+				peer.write_all(&[0x68, 14, 0, 0, 0, 0, 1, 1, 3, 0, 1, 0, 1, 0, 0, 1])
+					.await
+					.expect("ingress");
+			}
+		}
+		if when == 1 {
+			drop(peer);
+		}
+		assert_eq!(timeout(WAIT, rx.recv()).await.expect("callback must return"), Some(true));
+		timeout(WAIT, server.shutdown())
+			.await
+			.expect("external join deadline")
+			.expect("external join");
+		slot.lock().await.take();
+		let _listener = TcpListener::bind(addr).await.expect("listener released");
+	}
+}
+
+struct ShutdownFromRtu {
+	rtu: Arc<tokio::sync::Mutex<Option<iec104::rtu_server::RtuServerHandle>>>,
+	result: mpsc::UnboundedSender<bool>,
+}
+#[async_trait]
+impl iec104::rtu_server::RtuCommandHandler for ShutdownFromRtu {
+	async fn handle_command(
+		&self,
+		ctx: iec104::rtu_server::CommandContext<'_>,
+	) -> iec104::rtu_server::CommandHandling {
+		let rtu = self.rtu.lock().await.clone().expect("rtu installed");
+		let rejected = rtu.shutdown().await.is_err();
+		self.result.send(rejected).expect("result receiver");
+		iec104::rtu_server::RtuCommandHandler::handle_command(&RejectAllCommands, ctx).await
+	}
+}
+#[tokio::test]
+async fn shutdown_from_rtu_handler_returns_without_self_joining() {
+	let slot = Arc::new(tokio::sync::Mutex::new(None));
+	let (tx, mut rx) = mpsc::unbounded_channel();
+	let (rtu, addr) = start_rtu_server_ephemeral(
+		ServerConfig::default(),
+		Vec::<RtuInitialPoint>::new(),
+		Arc::new(ShutdownFromRtu { rtu: slot.clone(), result: tx }),
+		RtuSystemHandlers::default(),
+	)
+	.await
+	.expect("rtu");
+	*slot.lock().await = Some(rtu.clone());
+	let mut peer = started(addr).await;
+	peer.write_all(&[0x68, 14, 0, 0, 0, 0, 45, 1, 6, 0, 1, 0, 1, 0, 0, 1]).await.expect("command");
+	assert_eq!(timeout(WAIT, rx.recv()).await.expect("handler returns"), Some(true));
+	timeout(WAIT, rtu.shutdown()).await.expect("external join deadline").expect("external join");
+	slot.lock().await.take();
+	let _listener = TcpListener::bind(addr).await.expect("listener released");
+}

@@ -10,6 +10,17 @@ use crate::{
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum ServerError {
+	/// Server or per-peer command admission is full; caller may back off.
+	#[snafu(display("Command queue is full"))]
+	Overloaded,
+	/// Data transfer has not started on this connection.
+	#[snafu(display("Connection has not started data transfer"))]
+	NotStarted,
+	/// Peer failed to accept output within the configured deadline and was
+	/// closed.
+	#[snafu(display("Peer output deadline exceeded"))]
+	DeliveryTimedOut,
+
 	///Failed to start server
 	Start {
 		source: std::io::Error,

@@ -45,8 +45,25 @@ not block executor threads. After successful shutdown, owned tasks are joined an
 sockets released. Repeated calls are safe; a client can reconnect afterward.
 Dropping the last server/RTU handle or dropping a client requests cancellation
 without waiting. Retain a handle and await shutdown when completion matters.
-These limits do not yet bound the RTU actor mailbox or prevent a slow output peer
-from delaying a broadcast; that work remains tracked separately.
+`command_capacity` (default 256) bounds server commands, per-peer commands and
+in-flight deliveries. `delivery_timeout` (default 1 second) bounds delivery to a
+peer's protocol task; expiry disconnects that peer. A broadcast attempts every
+started peer before waiting for results, so a stalled or full peer cannot prevent
+another peer from receiving it. Success means local protocol admission, not a
+remote acknowledgement. A failed broadcast may have delivered to some peers;
+blindly retrying it can duplicate data.
+
+`rtu_queue_capacity` (default 1024) bounds the model mailbox. Local handle calls
+return `RtuHandleError::Overloaded` without enqueueing when it is full. Network
+ingress closes the overflowing peer, rather than acknowledging application
+acceptance or silently dropping requests. All three new settings must be nonzero.
+`max_pending_outgoing_asdu` still bounds the separate protocol-window queue;
+its existing explicit zero/unlimited option is unchanged.
+
+Use `Server::request_shutdown()` or `RtuServerHandle::request_shutdown()` inside
+callbacks, then await `shutdown()` from an external task. A shutdown call from
+the task it would join requests cancellation and returns an error instead of
+self-joining. Callbacks must not retain handles in permanent ownership cycles.
 
 ## Explicit system-command policy
 

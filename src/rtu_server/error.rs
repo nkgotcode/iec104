@@ -25,6 +25,10 @@ pub enum SetPointError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum RtuHandleError {
+	/// Model mailbox is full. No operation was queued; retry with backoff.
+	#[snafu(display("RTU model mailbox is full"))]
+	Overloaded,
+
 	/// The RTU actor task exited or the channel was closed.
 	#[snafu(display("RTU server is no longer running"))]
 	Disconnected,

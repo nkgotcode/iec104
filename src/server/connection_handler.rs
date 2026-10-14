@@ -46,6 +46,16 @@ impl Drop for ConnectionHandler {
 	}
 }
 
+struct ClosedNotification {
+	id: ConnectionId,
+	tx: mpsc::UnboundedSender<ConnectionId>,
+}
+impl Drop for ClosedNotification {
+	fn drop(&mut self) {
+		let _ = self.tx.send(self.id);
+	}
+}
+
 struct InnerConnectionHandler<C: ServerCallback + Send + Sync + 'static> {
 	read_connection: ReadHalf<Connection>,
 	write_connection: WriteHalf<Connection>,
@@ -67,7 +77,7 @@ impl ConnectionHandler {
 		tx: mpsc::UnboundedSender<ConnectionId>,
 	) -> Self {
 		let (read_connection, write_connection) = tokio::io::split(connection);
-		let (cmd_tx, rx) = mpsc::channel(1024);
+		let (cmd_tx, rx) = mpsc::channel(config.command_capacity);
 		let state = Arc::new(AtomicConnectionState::new(ConnectionState::WaitingStartDT));
 		let inner_connection_handler = InnerConnectionHandler {
 			read_connection,
@@ -79,13 +89,15 @@ impl ConnectionHandler {
 			address,
 			state: state.clone(),
 		};
-		let task = tokio::spawn(async move {
+		let closed = ClosedNotification { id, tx };
+		let owner = tokio::task::id();
+		let task = tokio::spawn(super::CALLBACK_OWNER.scope(owner, async move {
+			let _closed = closed;
 			let _ = inner_connection_handler
 				.start()
 				.await
 				.inspect_err(|e| tracing::error!("Error in running connection handler: {e}"));
-			let _ = tx.send(id);
-		});
+		}));
 		Self { id, address, task, tx: cmd_tx, state }
 	}
 	pub fn abort(&self) {
@@ -99,19 +111,42 @@ impl ConnectionHandler {
 		}
 	}
 
-	pub async fn send_asdu(&self, asdu: Asdu) -> Result<(), error::ServerError> {
+	pub fn enqueue_asdu(
+		&self,
+		asdu: Asdu,
+	) -> Result<oneshot::Receiver<Result<(), SendAsduQueueError>>, error::ServerError> {
+		if !self.is_started() {
+			return error::NotStarted.fail();
+		}
 		let (reply_tx, reply_rx) = oneshot::channel();
-		self.tx
-			.send(ReceiveHandlerCommand::Asdu { asdu, reply: reply_tx })
-			.await
-			.context(error::SendConnectionCommand)?;
-		match reply_rx.await.context(error::ReceiveHandlerAsduAck)? {
-			Ok(()) => Ok(()),
-			Err(SendAsduQueueError::PendingBufferFull) => {
-				error::PendingOutgoingAsduBufferFull.fail()
+		match self.tx.try_send(ReceiveHandlerCommand::Asdu { asdu, reply: reply_tx }) {
+			Ok(()) => Ok(reply_rx),
+			Err(mpsc::error::TrySendError::Full(_)) => error::Overloaded.fail(),
+			Err(mpsc::error::TrySendError::Closed(cmd)) => {
+				Err(mpsc::error::SendError(cmd)).context(error::SendConnectionCommand)
 			}
 		}
 	}
+
+	pub async fn wait_reply(
+		rx: oneshot::Receiver<Result<(), SendAsduQueueError>>,
+		abort: tokio::task::AbortHandle,
+		deadline: tokio::time::Instant,
+	) -> Result<(), error::ServerError> {
+		match tokio::time::timeout_at(deadline, rx).await {
+			Ok(result) => match result.context(error::ReceiveHandlerAsduAck)? {
+				Ok(()) => Ok(()),
+				Err(SendAsduQueueError::PendingBufferFull) => {
+					error::PendingOutgoingAsduBufferFull.fail()
+				}
+			},
+			Err(_) => {
+				abort.abort();
+				error::DeliveryTimedOut.fail()
+			}
+		}
+	}
+
 	pub fn is_started(&self) -> bool {
 		self.state.load(std::sync::atomic::Ordering::Relaxed) == ConnectionState::Started
 	}
@@ -163,7 +198,7 @@ impl<C: ServerCallback + Send + Sync + 'static> InnerConnectionHandler<C> {
 					}
 				}
 				ConnectionState::Started => {
-					self.callback.on_connection_started(self.id, self.address).await;
+					self.callback.on_connection_started(self.id, self.address).await?;
 					let rcv_handler = ReceiveHandler::new(
 						&mut self.read_connection,
 						&mut self.write_connection,

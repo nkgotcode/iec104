@@ -182,7 +182,10 @@ impl RtuServer {
 	) -> Result<RtuServerHandle, Error> {
 		let RtuInitialMaps { points, interrogation_groups, counter_groups } =
 			build_rtu_initial_maps(initial_points)?;
-		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+		if config.rtu_queue_capacity == 0 {
+			whatever!("RTU mailbox capacity must be nonzero");
+		}
+		let (tx, rx) = tokio::sync::mpsc::channel(config.rtu_queue_capacity);
 		let ingress = actor::NetworkIngress::new(tx.clone());
 		let server = crate::server::Server::start(config, ingress).await?;
 		let server_for_actor = server.clone();
@@ -214,7 +217,10 @@ pub async fn start_rtu_server_ephemeral(
 	server_config.port = 0;
 	let RtuInitialMaps { points, interrogation_groups, counter_groups } =
 		build_rtu_initial_maps(initial_points)?;
-	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+	if server_config.rtu_queue_capacity == 0 {
+		whatever!("RTU mailbox capacity must be nonzero");
+	}
+	let (tx, rx) = tokio::sync::mpsc::channel(server_config.rtu_queue_capacity);
 	let ingress = actor::NetworkIngress::new(tx.clone());
 	let (server, listen_addr) =
 		crate::server::Server::start_with_listen_addr(server_config, ingress).await?;
@@ -232,10 +238,11 @@ pub async fn start_rtu_server_ephemeral(
 }
 
 /// `Clone` handle for updates from any task (e.g. NATS subscriber). Sends into
-/// the actor via [`tokio::sync::mpsc::unbounded_channel`].
+/// a bounded actor mailbox. Full mailboxes return
+/// [`RtuHandleError::Overloaded`].
 #[derive(Clone)]
 pub struct RtuServerHandle {
-	tx: tokio::sync::mpsc::UnboundedSender<actor::ActorMsg>,
+	tx: tokio::sync::mpsc::Sender<actor::ActorMsg>,
 	lifecycle: Arc<RtuLifecycle>,
 }
 
@@ -259,7 +266,7 @@ impl std::fmt::Debug for RtuServerHandle {
 
 impl RtuServerHandle {
 	fn new(
-		tx: tokio::sync::mpsc::UnboundedSender<actor::ActorMsg>,
+		tx: tokio::sync::mpsc::Sender<actor::ActorMsg>,
 		server: crate::server::Server,
 		task: tokio::task::JoinHandle<()>,
 	) -> Self {
@@ -279,7 +286,10 @@ impl RtuServerHandle {
 	/// subsequent updates fail. Repeated calls are safe. Dropping the last
 	/// handle cancels the actor and requests network cleanup without joining.
 	pub async fn shutdown(&self) -> Result<(), Error> {
-		self.lifecycle.abort.abort();
+		self.request_shutdown();
+		if tokio::task::try_id() == Some(self.lifecycle.abort.id()) {
+			whatever!("Shutdown requested from an RTU callback; join from an external task");
+		}
 		let server_result = self.lifecycle.server.shutdown().await;
 		let mut task = self.lifecycle.task.lock().await;
 		if let Some(handle) = task.as_mut() {
@@ -294,6 +304,13 @@ impl RtuServerHandle {
 		server_result
 	}
 
+	/// Request cancellation without waiting. Safe inside a command callback.
+	/// Await [`Self::shutdown`] from an external task to join cleanup.
+	pub fn request_shutdown(&self) {
+		self.lifecycle.server.request_shutdown();
+		self.lifecycle.abort.abort();
+	}
+
 	/// Update an existing point and broadcast a spontaneous ASDU to all started
 	/// connections.
 	pub async fn set_point(
@@ -302,9 +319,12 @@ impl RtuServerHandle {
 		value: PointValue,
 	) -> Result<(), RtuHandleError> {
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-		self.tx
-			.send(actor::ActorMsg::SetPoint { address, value, reply: reply_tx })
-			.map_err(|_| RtuHandleError::Disconnected)?;
+		self.tx.try_send(actor::ActorMsg::SetPoint { address, value, reply: reply_tx }).map_err(
+			|error| match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			},
+		)?;
 		match reply_rx.await {
 			Err(_) => Err(RtuHandleError::ActorStopped),
 			Ok(r) => r.map_err(Into::into),
@@ -324,14 +344,17 @@ impl RtuServerHandle {
 	) -> Result<(), RtuHandleError> {
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 		self.tx
-			.send(actor::ActorMsg::Register {
+			.try_send(actor::ActorMsg::Register {
 				address,
 				initial,
 				interrogation_group: None,
 				counter_group: None,
 				reply: reply_tx,
 			})
-			.map_err(|_| RtuHandleError::Disconnected)?;
+			.map_err(|error| match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			})?;
 		finish_actor_register_reply(reply_rx).await
 	}
 
@@ -349,14 +372,17 @@ impl RtuServerHandle {
 		}
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 		self.tx
-			.send(actor::ActorMsg::Register {
+			.try_send(actor::ActorMsg::Register {
 				address,
 				initial,
 				interrogation_group: Some(interrogation_group),
 				counter_group: None,
 				reply: reply_tx,
 			})
-			.map_err(|_| RtuHandleError::Disconnected)?;
+			.map_err(|error| match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			})?;
 		finish_actor_register_reply(reply_rx).await
 	}
 
@@ -377,14 +403,17 @@ impl RtuServerHandle {
 		}
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 		self.tx
-			.send(actor::ActorMsg::Register {
+			.try_send(actor::ActorMsg::Register {
 				address,
 				initial,
 				interrogation_group: None,
 				counter_group: Some(counter_group),
 				reply: reply_tx,
 			})
-			.map_err(|_| RtuHandleError::Disconnected)?;
+			.map_err(|error| match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			})?;
 		finish_actor_register_reply(reply_rx).await
 	}
 
@@ -395,9 +424,12 @@ impl RtuServerHandle {
 	/// longer accept updates or command targets in the in-memory model.
 	pub async fn unregister_point(&self, address: PointAddress) -> Result<(), RtuHandleError> {
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-		self.tx
-			.send(actor::ActorMsg::Unregister { address, reply: reply_tx })
-			.map_err(|_| RtuHandleError::Disconnected)?;
+		self.tx.try_send(actor::ActorMsg::Unregister { address, reply: reply_tx }).map_err(
+			|error| match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			},
+		)?;
 		match reply_rx.await {
 			Err(_) => Err(RtuHandleError::ActorStopped),
 			Ok(Ok(())) => Ok(()),
@@ -416,9 +448,12 @@ impl RtuServerHandle {
 	) -> Result<(), RtuHandleError> {
 		let points: Vec<RtuInitialPoint> = points.into_iter().map(Into::into).collect();
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-		self.tx
-			.send(actor::ActorMsg::RegisterPoints { points, reply: reply_tx })
-			.map_err(|_| RtuHandleError::Disconnected)?;
+		self.tx.try_send(actor::ActorMsg::RegisterPoints { points, reply: reply_tx }).map_err(
+			|error| match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			},
+		)?;
 		finish_actor_register_reply(reply_rx).await
 	}
 
@@ -429,9 +464,12 @@ impl RtuServerHandle {
 	/// `Ok(0)`.
 	pub async fn unregister_all(&self) -> Result<usize, RtuHandleError> {
 		let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-		self.tx
-			.send(actor::ActorMsg::UnregisterAll { reply: reply_tx })
-			.map_err(|_| RtuHandleError::Disconnected)?;
+		self.tx.try_send(actor::ActorMsg::UnregisterAll { reply: reply_tx }).map_err(|error| {
+			match error {
+				tokio::sync::mpsc::error::TrySendError::Full(_) => RtuHandleError::Overloaded,
+				tokio::sync::mpsc::error::TrySendError::Closed(_) => RtuHandleError::Disconnected,
+			}
+		})?;
 		match reply_rx.await {
 			Err(_) => Err(RtuHandleError::ActorStopped),
 			Ok(n) => Ok(n),

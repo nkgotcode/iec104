@@ -1,5 +1,14 @@
 # Changes in this fork
 
+## Unreleased — bounded delivery
+
+- Bound the RTU mailbox, server command queues and concurrent delivery tasks with configurable defaults and explicit overload errors.
+- Attempt broadcast delivery to every started peer independently; abort peers that miss the delivery deadline and reclaim their admission slots.
+- Add fallible callback admission hooks while preserving existing callback implementations.
+- Add callback-safe shutdown requests and reject self-joins (follow-up to the review on #8).
+- Add real-TCP overload, slow-peer and callback-shutdown regressions. Public configuration struct literals require new fields or defaults.
+
+
 ## 0.5.2-dev.0 — unreleased development revision
 
 Based on upstream 0.5.1, commit `162cbead586de10d2a22687ab9d4f5b30946091c`.
