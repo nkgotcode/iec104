@@ -340,3 +340,37 @@ async fn failed_handshake_releases_old_socket_before_retrying_connect() {
 	);
 	client.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn every_fragment_split_survives_interleaved_outgoing_commands() {
+	let (tx, mut rx) = mpsc::unbounded_channel();
+	let (server, addr) = Server::start_with_listen_addr(
+		ServerConfig {
+			port: 0,
+			protocol: iec104::config::ProtocolConfig { k: 32767, w: 21844, ..Default::default() },
+			..Default::default()
+		},
+		Callback(tx),
+	)
+	.await
+	.expect("server");
+	let mut peer = TcpStream::connect(addr).await.expect("peer");
+	peer.write_all(&[0x68, 4, 7, 0, 0, 0]).await.expect("start");
+	assert_eq!(frame(&mut peer).await, [0x68, 4, 11, 0, 0, 0]);
+	let sample = Asdu::parse(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 1]).expect("sample");
+	for split in 1..16 {
+		let n = (split - 1) as u16;
+		let seq = (n << 1).to_le_bytes();
+		let incoming = [0x68, 14, seq[0], seq[1], seq[0], seq[1], 1, 1, 3, 0, 1, 0, 1, 0, 0, 1];
+		peer.write_all(&incoming[..split]).await.expect("partial input");
+		// Give the read branch a turn, then require the outgoing branch to
+		// complete before providing the rest of the input.
+		tokio::time::sleep(Duration::from_millis(5)).await;
+		server.broadcast_asdu(sample.clone()).await.expect("interleaved output");
+		let outgoing = frame(&mut peer).await;
+		assert_eq!(u16::from_le_bytes([outgoing[2], outgoing[3]]) >> 1, n);
+		peer.write_all(&incoming[split..]).await.expect("remaining input");
+		assert_eq!(timeout(WAIT, rx.recv()).await.expect("ingress deadline"), Some(sample.clone()));
+	}
+	server.shutdown().await.expect("shutdown");
+}
